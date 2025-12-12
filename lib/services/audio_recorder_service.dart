@@ -85,12 +85,17 @@ class AudioRecorderService {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       _currentRecordingPath = '${directory.path}/recording_$timestamp.wav';
       
-      // Start recording with amplitude monitoring
+      // Start recording with amplitude monitoring and noise reduction
       await _recorder.start(
         const RecordConfig(
           encoder: AudioEncoder.wav,
-          bitRate: 128000, // Not used for WAV but good to keep or remove
+          bitRate: 128000,
           sampleRate: 44100,
+          numChannels: 1, // Mono for better noise reduction
+          // 🎤 Noise Reduction Features 🎤
+          noiseSuppress: true,  // ✅ Reduces background noise
+          autoGain: true,       // ✅ Normalizes volume levels
+          echoCancel: true,     // ✅ Removes echo
         ),
         path: _currentRecordingPath!,
       );

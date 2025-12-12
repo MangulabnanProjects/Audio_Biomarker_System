@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import '../services/audio_recorder_service.dart';
 import '../services/firebase_service.dart';
 import '../services/database_service.dart'; // Import DatabaseService
+import '../services/assemblyai_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:path_provider/path_provider.dart';
 import '../widgets/waveform_visualizer.dart';
@@ -21,6 +22,7 @@ class AudioRecorderScreen extends StatefulWidget {
 
 class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   final AudioRecorderService _audioService = AudioRecorderService();
+  final AssemblyAIService _transcriptionService = AssemblyAIService();
   bool _isRecording = false;
   bool _isPaused = false;
   double _currentLevel = 0.0;
@@ -29,6 +31,11 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   StreamSubscription? _amplitudeSubscription;
   String _statusMessage = 'Ready to record';
   int _selectedNavIndex = 0; // Start on Home tab by default
+  
+  // Transcription State
+  String _transcriptionText = '';
+  StreamSubscription? _transcriptionSubscription;
+  
   // Session Details State
   bool _hasShownSessionDetails = false;
   final Map<String, String> _sessionDetails = {};
@@ -68,11 +75,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   // Storage Folders State
   // Map<String, List<Map<String, String>>> where inner list contains file info
   // Keys: name, duration, date, size
-  Map<String, List<Map<String, String>>> _allFolders = {
-    'Meetings': [],
-    'Interviews': [],
-    'Personal Notes': [],
-  };
+  Map<String, List<Map<String, String>>> _allFolders = {};
   
   // Folder Metadata for partial user info storage
   Map<String, Map<String, dynamic>> _folderMetadata = {};
@@ -188,10 +191,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         }
       }
 
-      // 3. Add "Personal Notes" default
-      if (!loadedFolders.containsKey('Personal Notes')) {
-        loadedFolders['Personal Notes'] = [];
-      }
+      // Load complete - no default folders
 
       // 4. Update UI
       if (mounted) {
@@ -221,6 +221,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       });
     });
   }
+
 
   Future<void> _toggleRecording() async {
     if (_isRecording) {
@@ -271,6 +272,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         _isPaused = false;
         _recordingDuration = Duration.zero;
         _statusMessage = 'Recording...';
+        _transcriptionText = 'Recording... Transcription will appear after stopping.';
       });
 
       // Start duration timer
@@ -302,7 +304,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       final durationStr = _formatDuration(duration); // Using existing helper
       
       // Determine folder
-      String folderName = _sessionDetails['folder'] ?? 'Personal Notes';
+      String folderName = _sessionDetails['folder'] ?? 'Uncategorized';
       
       // Save to Firebase (Optional mostly for metadata now)
       final firebaseId = await FirebaseService.saveRecording(
@@ -354,6 +356,59 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         _statusMessage = 'Failed to save recording';
       });
     }
+    
+    // Transcribe with AssemblyAI (post-recording)
+    if (path != null) {
+      // Show loading dialog
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const Center(
+          child: Card(
+            child: Padding(
+              padding: EdgeInsets.all(20.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Transcribing audio...'),
+                  SizedBox(height: 8),
+                  Text('This may take a minute', style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      
+      try {
+        final transcription = await _transcriptionService.transcribeFile(path);
+        
+        // Close loading dialog
+        if (mounted) Navigator.of(context).pop();
+        
+        // Update transcription text
+        setState(() {
+          _transcriptionText = transcription;
+        });
+        
+        // Show result popup
+        if (mounted) {
+          _showTranscriptionDialog(transcription);
+        }
+      } catch (e) {
+        print('❌ Transcription error: $e');
+        
+        // Close loading dialog
+        if (mounted) Navigator.of(context).pop();
+        
+        // Show error
+        if (mounted) {
+          _showTranscriptionDialog('[Transcription failed: $e]');
+        }
+      }
+    }
 
     // Reset status message after a delay
     Future.delayed(const Duration(seconds: 3), () {
@@ -387,6 +442,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   void dispose() {
     _timer?.cancel();
     _amplitudeSubscription?.cancel();
+    _transcriptionSubscription?.cancel();
     _audioService.dispose();
     _folderController.dispose();
     _nameController.dispose();
@@ -1195,11 +1251,11 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                             
                             const SizedBox(height: 20),
                             
-                            // Real-time Transcription Box (Dummy for now)
+                            // Real-time Transcription Box
                             Container(
                               width: double.infinity,
                               constraints: const BoxConstraints(
-                                minHeight: 120, // Minimum height for the transcription box
+                                minHeight: 200, // Increased height for better visibility
                               ),
                               padding: const EdgeInsets.all(24),
                               decoration: BoxDecoration(
@@ -1241,12 +1297,79 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                                   const SizedBox(height: 15),
                                   Text(
                                     _isRecording 
-                                      ? 'Transcription will appear here...'
+                                      ? (_transcriptionText.isEmpty ? 'Listening...' : _transcriptionText)
                                       : 'Start recording to see transcription',
                                     style: TextStyle(
                                       fontSize: 14,
-                                      color: Colors.grey[600],
-                                      fontStyle: FontStyle.italic,
+                                      color: _transcriptionText.isNotEmpty && _isRecording
+                                          ? Colors.black87
+                                          : Colors.grey[600],
+                                      fontStyle: _transcriptionText.isEmpty ? FontStyle.italic : FontStyle.normal,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            
+                            const SizedBox(height: 20),
+                            
+                            // Suggested Questions Box
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(24),
+                              decoration: BoxDecoration(
+                                color: Colors.white,
+                                borderRadius: BorderRadius.circular(15),
+                                border: Border.all(
+                                  color: const Color(0xFF81C784),
+                                  width: 2,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.green.withOpacity(0.1),
+                                    blurRadius: 8,
+                                    spreadRadius: 1,
+                                  ),
+                                ],
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: const [
+                                      Icon(
+                                        Icons.psychology,
+                                        color: Color(0xFF2E7D32),
+                                        size: 20,
+                                      ),
+                                      SizedBox(width: 8),
+                                      Text(
+                                        'Suggested Questions',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                          color: Color(0xFF2E7D32),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 15),
+                                  Container(
+                                    constraints: const BoxConstraints(maxHeight: 250),
+                                    child: SingleChildScrollView(
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          _buildSuggestedQuestion('How have you been feeling lately?'),
+                                          _buildSuggestedQuestion('What brought you here today?'),
+                                          _buildSuggestedQuestion('Can you tell me more about that experience?'),
+                                          _buildSuggestedQuestion('How has this been affecting your daily life?'),
+                                          _buildSuggestedQuestion('What coping strategies have you tried?'),
+                                          _buildSuggestedQuestion('How would you describe your support system?'),
+                                          _buildSuggestedQuestion('What are your goals for our sessions?'),
+                                          _buildSuggestedQuestion('Is there anything else you\'d like to share?'),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -2111,67 +2234,144 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   }
 
   Widget _buildRecentTab() {
-    return ListView(
-      children: [
-        _buildRecentItem('Meeting_Notes.m4a', 'Today, 2:30 PM', '45:20'),
-        _buildRecentItem('Interview_Session.m4a', 'Yesterday, 10:15 AM', '32:10'),
-        _buildRecentItem('Podcast_Ep5.m4a', 'Dec 10, 3:45 PM', '1:12:30'),
-      ],
+    // Gather all recordings from all folders
+    List<Map<String, String>> allRecordings = [];
+    
+    _allFolders.forEach((folderName, recordings) {
+      for (var recording in recordings) {
+        allRecordings.add({
+          'name': recording['name'] ?? '',
+          'date': recording['date'] ?? '',
+          'duration': recording['duration'] ?? '00:00',
+          'path': recording['path'] ?? '',
+          'folder': folderName,
+        });
+      }
+    });
+    
+    // Sort by date (most recent first) - simple approach using the date string
+    // Note: This is a simple sort. For production, parse dates properly
+    allRecordings.sort((a, b) {
+      // Most recent should be first, so reverse comparison
+      return (b['date'] ?? '').compareTo(a['date'] ?? '');
+    });
+    
+    // Take only the first 10 most recent
+    final recentRecordings = allRecordings.take(10).toList();
+    
+    // Build the UI
+    if (recentRecordings.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(40.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.history,
+                size: 64,
+                color: Colors.grey[300],
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'No recordings yet',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.grey[600],
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Your recent recordings will appear here',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Colors.grey[500],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    
+    return ListView.builder(
+      itemCount: recentRecordings.length,
+      itemBuilder: (context, index) {
+        final recording = recentRecordings[index];
+        return _buildRecentItem(
+          recording['name']!,
+          recording['date']!,
+          recording['duration']!,
+          recording['path']!,
+        );
+      },
     );
   }
 
-  Widget _buildRecentItem(String name, String date, String duration) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF2E7D32).withOpacity(0.1),
-              borderRadius: BorderRadius.circular(8),
+  Widget _buildRecentItem(String name, String date, String duration, String path) {
+    return InkWell(
+      onTap: () {
+        // Play the audio when tapped
+        _playAudio(name, duration, path);
+      },
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.grey.shade200),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2E7D32).withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(
+                _selectedAudioName == name ? Icons.graphic_eq : Icons.audiotrack,
+                color: const Color(0xFF2E7D32),
+                size: 20,
+              ),
             ),
-            child: const Icon(Icons.audiotrack, color: Color(0xFF2E7D32), size: 20),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  name,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 14,
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    name,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  date,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Colors.grey[600],
+                  const SizedBox(height: 4),
+                  Text(
+                    date,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey[600],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          Text(
-            duration,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              color: Color(0xFF2E7D32),
+            Text(
+              duration,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Color(0xFF2E7D32),
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -2887,6 +3087,64 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Show transcription result in popup dialog
+  void _showTranscriptionDialog(String transcription) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: const [
+            Icon(Icons.transcribe, color: Color(0xFF2E7D32)),
+            SizedBox(width: 8),
+            Text('Transcription Result'),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            transcription,
+            style: const TextStyle(fontSize: 16),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSuggestedQuestion(String question) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.only(top: 2),
+            child: Icon(
+              Icons.arrow_right,
+              color: Color(0xFF2E7D32),
+              size: 20,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              question,
+              style: TextStyle(
+                fontSize: 13,
+                color: Colors.grey[700],
+                height: 1.4,
+              ),
             ),
           ),
         ],
