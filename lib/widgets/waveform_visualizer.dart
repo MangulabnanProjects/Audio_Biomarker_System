@@ -11,10 +11,10 @@ class WaveformVisualizer extends StatefulWidget {
   });
 
   @override
-  State<WaveformVisualizer> createState() => _WaveformVisualizerState();
+  State<WaveformVisualizer> createState() => WaveformVisualizerState();
 }
 
-class _WaveformVisualizerState extends State<WaveformVisualizer> {
+class WaveformVisualizerState extends State<WaveformVisualizer> {
   // Store history of levels to create scrolling effect
   // Increased to 120 for finer grain (more bars)
   final List<double> _levelHistory = List.filled(120, 0.0, growable: true);
@@ -39,6 +39,11 @@ class _WaveformVisualizerState extends State<WaveformVisualizer> {
         }
       });
     }
+  }
+
+  // Public method to get waveform data for saving
+  List<double> getWaveformData() {
+    return List.from(_levelHistory);
   }
 
   @override

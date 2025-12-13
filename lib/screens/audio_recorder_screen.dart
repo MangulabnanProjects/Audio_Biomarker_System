@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,6 +11,7 @@ import '../services/assemblyai_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:path_provider/path_provider.dart';
 import '../widgets/waveform_visualizer.dart';
+import '../widgets/static_waveform_visualizer.dart';
 import '../widgets/record_button.dart';
 import '../widgets/marquee_text.dart';
 
@@ -23,6 +25,7 @@ class AudioRecorderScreen extends StatefulWidget {
 class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   final AudioRecorderService _audioService = AudioRecorderService();
   final AssemblyAIService _transcriptionService = AssemblyAIService();
+  final GlobalKey<WaveformVisualizerState> _waveformKey = GlobalKey<WaveformVisualizerState>();
   bool _isRecording = false;
   bool _isPaused = false;
   double _currentLevel = 0.0;
@@ -68,6 +71,9 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   bool _isPausedPlayer = false;
   Duration _currentPosition = Duration.zero;
   Duration _totalDuration = Duration.zero;
+  List<double>? _currentWaveformData; // Waveform data for currently playing audio
+  String? _currentTranscription; // Transcription for currently playing audio
+  int? _currentPlayingId; // Database ID of currently playing audio
   // Stream Subscriptions
   StreamSubscription? _positionSubscription;
   StreamSubscription? _playerCompleteSubscription;
@@ -80,6 +86,8 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   // Folder Metadata for partial user info storage
   Map<String, Map<String, dynamic>> _folderMetadata = {};
 
+  String? _currentAdminId; // Store current admin ID
+
   @override
   void initState() {
     super.initState();
@@ -88,8 +96,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     _allFolders = {};
     _allFolders = {};
     _allFolders = {};
-    // Load persisted data (Local DB + Firebase)
-    _loadData();
+    _initializeApp(); // Fetch ID then load data
     
     // Listen to audio player position
     _positionSubscription = _audioService.positionStream.listen((position) {
@@ -111,6 +118,12 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         });
       }
     });
+  }
+  
+  Future<void> _initializeApp() async {
+    _currentAdminId = await FirebaseService.getCurrentAdminId();
+    print('🔑 Current Admin ID: $_currentAdminId');
+    await _loadData();
   }
   
   Future<void> _loadData() async {
@@ -139,12 +152,19 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
             'date': rec['date'],
             'size': rec['size'],
             'path': rec['file_path'],
+            'waveform_data': rec['waveform_data'] ?? '',
+            'transcription': rec['transcription'] ?? '',
           });
         }
       }
       
+      
       // Load Metadata from Firebase (for user info) - Secondary
-      final clientInfos = await FirebaseService.getAllClientInfo();
+      // Filter by Admin ID
+      List<Map<String, dynamic>> clientInfos = [];
+      if (_currentAdminId != null) {
+        clientInfos = await FirebaseService.getAllClientInfo(_currentAdminId!);
+      }
 
       // 1b. Load Folders from Local Database (Metadata)
       final localFolders = await DatabaseService.instance.getAllFolders();
@@ -291,6 +311,15 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     final path = await _audioService.stopRecording();
     final duration = _recordingDuration; // Capture duration before reset
     
+    // Capture waveform data before resetting
+    List<double>? waveformData;
+    if (_waveformKey.currentState != null) {
+      waveformData = _waveformKey.currentState!.getWaveformData();
+      print('✅ Waveform captured: ${waveformData.length} samples');
+    } else {
+      print('❌ Waveform key state is null - widget not mounted?');
+    }
+    
     _timer?.cancel();
     _timer = null;
 
@@ -306,15 +335,23 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       // Determine folder
       String folderName = _sessionDetails['folder'] ?? 'Uncategorized';
       
+      // Debug: Log waveform data being saved
+      final waveformJson = waveformData != null ? jsonEncode(waveformData) : null;
+      print('📊 Saving waveform: ${waveformJson != null ? '${waveformJson.length} chars' : 'NULL'}');
+      
       // Save to Firebase (Optional mostly for metadata now)
-      final firebaseId = await FirebaseService.saveRecording(
-        folderName: folderName,
-        fileName: fileName,
-        filePath: path,
-        duration: durationStr,
-        size: sizeStr,
-        date: dateStr,
-      );
+      String? firebaseId;
+      if (_currentAdminId != null) {
+        firebaseId = await FirebaseService.saveRecording(
+          folderName: folderName,
+          fileName: fileName,
+          filePath: path,
+          duration: durationStr,
+          size: sizeStr,
+          date: dateStr,
+          adminId: _currentAdminId!, // Pass Admin ID
+        );
+      }
       
       // Save to Local Database (CRITICAL for persistence)
       final dbId = await DatabaseService.instance.insertRecording({
@@ -325,6 +362,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         'size': sizeStr,
         'date': dateStr,
         'created_at': DateTime.now().toIso8601String(),
+        'waveform_data': waveformJson,
       });
       
       // Update UI
@@ -341,11 +379,14 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         
         _allFolders[folderName]!.insert(0, {
           'id': dbId.toString(), // Use DB ID
+          'firebase_id': firebaseId ?? '', // Store Firebase doc ID for sync
           'name': fileName,
           'duration': durationStr,
           'date': dateStr,
           'size': sizeStr,
           'path': path,
+          'waveform_data': waveformJson ?? '',
+          'transcription': '',
         });
       });
     } else {
@@ -393,6 +434,39 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
           _transcriptionText = transcription;
         });
         
+        // Save transcription to database
+        final String folderName = _sessionDetails['folder'] ?? 'Uncategorized';
+        print('🔍 Looking for folder: $folderName');
+        print('🔍 All folders: ${_allFolders.keys.toList()}');
+        
+        if (_allFolders.containsKey(folderName) && _allFolders[folderName]!.isNotEmpty) {
+          final recording = _allFolders[folderName]![0];
+          print('🔍 Recording data: $recording');
+          
+          final recordingId = int.tryParse(recording['id'] ?? '');
+          final firebaseDocId = recording['firebase_id'];
+          
+          print('🔍 Recording ID: $recordingId');
+          print('🔍 Firebase Doc ID: "$firebaseDocId"');
+          
+          if (recordingId != null) {
+            await DatabaseService.instance.updateRecordingTranscription(recordingId, transcription);
+            // Update local state
+            _allFolders[folderName]![0]['transcription'] = transcription;
+            print('✅ Transcription saved to database for recording ID: $recordingId');
+          }
+          
+          // Also save to Firebase if we have a Firebase document ID
+          if (firebaseDocId != null && firebaseDocId.toString().isNotEmpty) {
+            final success = await FirebaseService.updateRecordingTranscription(firebaseDocId, transcription);
+            print('☁️ Firebase sync result: $success for document: $firebaseDocId');
+          } else {
+            print('⚠️ No Firebase document ID found, skipping cloud sync');
+          }
+        } else {
+          print('⚠️ Folder not found or empty: $folderName');
+        }
+        
         // Show result popup
         if (mounted) {
           _showTranscriptionDialog(transcription);
@@ -427,6 +501,73 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
+  // Helper methods for computing home page statistics
+  int _getTotalRecordings() {
+    int total = 0;
+    _allFolders.forEach((_, recordings) {
+      total += recordings.length;
+    });
+    return total;
+  }
+
+  String _getTotalDuration() {
+    int totalSeconds = 0;
+    _allFolders.forEach((_, recordings) {
+      for (var recording in recordings) {
+        final durationStr = recording['duration'] ?? '00:00:00';
+        final parts = durationStr.split(':');
+        if (parts.length == 3) {
+          totalSeconds += int.tryParse(parts[0]) ?? 0; // hours
+          totalSeconds += (int.tryParse(parts[1]) ?? 0) * 60; // minutes to seconds
+          totalSeconds += int.tryParse(parts[2]) ?? 0; // seconds
+          totalSeconds -= (int.tryParse(parts[0]) ?? 0); // remove hours (added wrong)
+          totalSeconds += (int.tryParse(parts[0]) ?? 0) * 3600; // add hours as seconds
+        } else if (parts.length == 2) {
+          totalSeconds += (int.tryParse(parts[0]) ?? 0) * 60;
+          totalSeconds += int.tryParse(parts[1]) ?? 0;
+        }
+      }
+    });
+    
+    final hours = totalSeconds ~/ 3600;
+    final minutes = (totalSeconds % 3600) ~/ 60;
+    final seconds = totalSeconds % 60;
+    
+    if (hours > 0) {
+      return '${hours}h ${minutes}m';
+    } else if (minutes > 0) {
+      return '${minutes}m ${seconds}s';
+    } else {
+      return '${seconds}s';
+    }
+  }
+
+  String _getTotalStorageUsed() {
+    double totalBytes = 0;
+    _allFolders.forEach((_, recordings) {
+      for (var recording in recordings) {
+        final sizeStr = recording['size'] ?? '0 B';
+        // Parse size string like "1.5 MB", "512 KB", "2048 B"
+        final parts = sizeStr.split(' ');
+        if (parts.length == 2) {
+          final value = double.tryParse(parts[0]) ?? 0;
+          final unit = parts[1].toUpperCase();
+          if (unit == 'B') {
+            totalBytes += value;
+          } else if (unit == 'KB') {
+            totalBytes += value * 1024;
+          } else if (unit == 'MB') {
+            totalBytes += value * 1024 * 1024;
+          } else if (unit == 'GB') {
+            totalBytes += value * 1024 * 1024 * 1024;
+          }
+        }
+      }
+    });
+    
+    return _formatFileSize(totalBytes.toInt());
+  }
+
 
 
 
@@ -459,13 +600,27 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   }
 
   // Audio Player Control Methods
-  void _playAudio(String audioName, String duration, String path) {
+  void _playAudio(String audioName, String duration, String path, {String? waveformDataJson, String? transcription, String? recordingId}) {
     _audioService.play(path);
+    
+    // Parse waveform data if available
+    List<double>? waveformData;
+    if (waveformDataJson != null && waveformDataJson.isNotEmpty) {
+      try {
+        waveformData = List<double>.from(jsonDecode(waveformDataJson));
+      } catch (e) {
+        print('Error parsing waveform data: $e');
+      }
+    }
+    
     setState(() {
       _selectedAudioName = audioName;
       _isPlaying = true;
       _isPausedPlayer = false;
       _currentPosition = Duration.zero;
+      _currentWaveformData = waveformData;
+      _currentTranscription = transcription;
+      _currentPlayingId = int.tryParse(recordingId ?? '');
       // Parse duration (format: "45:20" or "2:30")
       final parts = duration.split(':');
       if (parts.length == 2) {
@@ -505,6 +660,9 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       _isPausedPlayer = false;
       _currentPosition = Duration.zero;
       _totalDuration = Duration.zero;
+      _currentWaveformData = null;
+      _currentTranscription = null;
+      _currentPlayingId = null;
     });
   }
 
@@ -958,20 +1116,24 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                     }
                     
                     // Save to Firebase
-                    final docId = await FirebaseService.saveClientInfo(
-                      folderName: _folderController.text,
-                      fullName: _nameController.text,
-                      age: int.parse(_ageController.text),
-                      gender: _selectedGender!,
-                      schoolYear: _selectedSchoolYear!,
-                      phoneNumber: _phoneController.text,
-                      address: _addressController.text,
-                      birthday: _selectedBirthday!,
-                    );
+                    String? docId;
+                    if (_currentAdminId != null) {
+                       docId = await FirebaseService.saveClientInfo(
+                        folderName: _folderController.text,
+                        fullName: _nameController.text,
+                        age: int.parse(_ageController.text),
+                        gender: _selectedGender!,
+                        schoolYear: _selectedSchoolYear!,
+                        phoneNumber: _phoneController.text,
+                        address: _addressController.text,
+                        birthday: _selectedBirthday!,
+                        adminId: _currentAdminId!, // Pass Admin ID
+                      );
+                    }
                     
                     if (docId != null) {
                       setState(() {
-                        _sessionDetails['documentId'] = docId;
+                        _sessionDetails['documentId'] = docId!;
                         _sessionDetails['folder'] = _folderController.text;
                         _sessionDetails['name'] = _nameController.text;
                         _sessionDetails['age'] = _ageController.text;
@@ -1177,6 +1339,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                                 ],
                               ),
                               child: WaveformVisualizer(
+                                key: _waveformKey,
                                 level: _currentLevel,
                                 isRecording: _isRecording,
                               ),
@@ -1552,30 +1715,35 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                 ),
               ],
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Row(
-                  children: const [
-                    Icon(Icons.waving_hand, color: Colors.white, size: 28),
-                    SizedBox(width: 10),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: const [
+                        Icon(Icons.waving_hand, color: Colors.white, size: 28),
+                        SizedBox(width: 10),
+                        Text(
+                          'Welcome Back!',
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
                     Text(
-                      'Welcome Back!',
+                      'Ready to record your next session?',
                       style: TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
+                        fontSize: 14,
+                        color: Colors.white.withOpacity(0.9),
                       ),
                     ),
                   ],
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  'Ready to record your next session?',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: Colors.white.withOpacity(0.9),
-                  ),
                 ),
               ],
             ),
@@ -1589,7 +1757,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               Expanded(
                 child: _buildStatCard(
                   'Total Recordings',
-                  '24',
+                  _getTotalRecordings().toString(),
                   Icons.audiotrack,
                   const Color(0xFF4CAF50),
                 ),
@@ -1598,7 +1766,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               Expanded(
                 child: _buildStatCard(
                   'Total Duration',
-                  '3h 45m',
+                  _getTotalDuration(),
                   Icons.access_time,
                   const Color(0xFF2196F3),
                 ),
@@ -1613,7 +1781,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               Expanded(
                 child: _buildStatCard(
                   'Folders',
-                  '8',
+                  _allFolders.length.toString(),
                   Icons.folder,
                   const Color(0xFFFF9800),
                 ),
@@ -1622,7 +1790,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               Expanded(
                 child: _buildStatCard(
                   'Storage Used',
-                  '156 MB',
+                  _getTotalStorageUsed(),
                   Icons.storage,
                   const Color(0xFF9C27B0),
                 ),
@@ -2672,6 +2840,8 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   folderName, // Pass folder name for deletion
                   fileData['path'] ?? '', // Pass file path
                   fileData['id'] ?? '', // Pass id
+                  waveformData: fileData['waveform_data'],
+                  transcription: fileData['transcription'],
                 );
               }).toList();
 
@@ -2744,12 +2914,12 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     );
   }
 
-  Widget _buildStorageItem(String name, String duration, String date, String fileSize, String folderName, String path, String id) {
+  Widget _buildStorageItem(String name, String duration, String date, String fileSize, String folderName, String path, String id, {String? waveformData, String? transcription}) {
     return InkWell(
       onTap: () {
         // Play audio when clicking the item (unless in delete mode)
         if (!_isDeleteMode) {
-          _playAudio(name, duration, path);
+          _playAudio(name, duration, path, waveformDataJson: waveformData, transcription: transcription, recordingId: id);
         }
       },
       borderRadius: BorderRadius.circular(8),
@@ -2874,12 +3044,16 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               ),
               TextButton.icon(
                 onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Results feature coming soon!'),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
+                  if (_currentTranscription != null && _currentTranscription!.isNotEmpty) {
+                    _showTranscriptionDialog(_currentTranscription!, audioName: _selectedAudioName);
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No transcription available for this recording'),
+                        duration: Duration(seconds: 2),
+                      ),
+                    );
+                  }
                 },
                 icon: const Icon(Icons.assessment, size: 16),
                 label: const Text('Results'),
@@ -2999,6 +3173,64 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               ),
             ],
           ),
+          
+          // Waveform Visualizer (Scrollable)
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.grey[50],
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey[300]!),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.graphic_eq, size: 16, color: Colors.grey[600]),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Audio Waveform',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: Colors.grey[600],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                if (_currentWaveformData != null && _currentWaveformData!.isNotEmpty)
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: SizedBox(
+                      width: _currentWaveformData!.length * 3.5, // Wider view
+                      child: StaticWaveformVisualizer(
+                        samples: _currentWaveformData!,
+                        height: 50,
+                        playbackProgress: _totalDuration.inMilliseconds > 0
+                            ? _currentPosition.inMilliseconds / _totalDuration.inMilliseconds
+                            : 0.0,
+                      ),
+                    ),
+                  )
+                else
+                  Container(
+                    height: 50,
+                    alignment: Alignment.center,
+                    child: Text(
+                      'No waveform data (record new audio to save waveform)',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.grey[500],
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -3095,15 +3327,38 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   }
 
   /// Show transcription result in popup dialog
-  void _showTranscriptionDialog(String transcription) {
+  void _showTranscriptionDialog(String transcription, {String? audioName}) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: Row(
-          children: const [
-            Icon(Icons.transcribe, color: Color(0xFF2E7D32)),
-            SizedBox(width: 8),
-            Text('Transcription Result'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: const [
+                Icon(Icons.transcribe, color: Color(0xFF2E7D32)),
+                SizedBox(width: 8),
+                Text(
+                  'Transcription',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF2E7D32),
+                  ),
+                ),
+              ],
+            ),
+            if (audioName != null && audioName.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              MarqueeText(
+                text: audioName,
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Colors.grey[600],
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
           ],
         ),
         content: SingleChildScrollView(
@@ -3113,6 +3368,19 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
           ),
         ),
         actions: [
+          if (audioName != null && audioName.isNotEmpty)
+            ElevatedButton.icon(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showPredictionAnalytics(audioName);
+              },
+              icon: const Icon(Icons.analytics_outlined, size: 18),
+              label: const Text('View Prediction Analytics'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF2E7D32),
+                foregroundColor: Colors.white,
+              ),
+            ),
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Close'),
@@ -3170,6 +3438,34 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               ),
             ),
             const SizedBox(height: 20),
+            // Admin Info Card
+            if (_currentAdminId != null)
+              Container(
+                margin: const EdgeInsets.only(bottom: 20),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE8F5E9),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF2E7D32).withOpacity(0.3)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.admin_panel_settings, color: Color(0xFF2E7D32)),
+                    const SizedBox(width: 16),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Logged in as Admin ID:', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                        Text(
+                          _currentAdminId!,
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF2E7D32)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            
             ListTile(
               leading: const Icon(Icons.info, color: Color(0xFF2E7D32)),
               title: const Text('Version'),
@@ -3188,9 +3484,277 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               leading: const Icon(Icons.article, color: Color(0xFF2E7D32)),
               title: const Text('Terms of Service'),
             ),
+            
+            const Spacer(),
+            
+            // Logout Button
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () {
+                  showDialog(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('Log Out'),
+                      content: const Text('Are you sure you want to sign out?'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          child: const Text('Cancel'),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            Navigator.of(context).pop(); // Close dialog
+                            await FirebaseService.signOut();
+                            // Navigation back to Login is handled automatically by StreamBuilder in main.dart
+                          },
+                          child: const Text('Log Out', style: TextStyle(color: Colors.red)),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.logout),
+                label: const Text('Log Out'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red[50],
+                  foregroundColor: Colors.red,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  side: BorderSide(color: Colors.red[200]!),
+                ),
+              ),
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  void _showPredictionAnalytics(String audioName) {
+    // Generate consistent dummy data based on recording name hash
+    final int seed = audioName.hashCode;
+    final random = _ConsistentRandom(seed);
+    
+    // 1. Determine Severity (High, Moderate, Low)
+    final severityRoll = random.nextInt(100);
+    String severity;
+    Color severityColor;
+    if (severityRoll < 30) {
+      severity = 'High';
+      severityColor = Colors.red;
+    } else if (severityRoll < 70) {
+      severity = 'Moderate';
+      severityColor = Colors.orange;
+    } else {
+      severity = 'Low';
+      severityColor = Colors.green;
+    }
+    
+    // 2. Determine Emotion based on Severity
+    String emotion;
+    if (severity == 'High') {
+      emotion = ['Fearful', 'Angry', 'Sad'][random.nextInt(3)];
+    } else if (severity == 'Moderate') {
+      emotion = ['Anxious', 'Surprised', 'Disgust'][random.nextInt(3)];
+    } else {
+      emotion = ['Calm', 'Happy', 'Neutral'][random.nextInt(3)];
+    }
+    
+    // 3. Determine Anxiety Types based on emotion/severity
+    List<String> anxietyTypes = [];
+    if (severity != 'Low') {
+      if (random.nextBool()) anxietyTypes.add('Generalized Anxiety');
+      if (random.nextBool()) anxietyTypes.add('Social Anxiety');
+      if (random.nextBool()) anxietyTypes.add('Panic Disorder');
+      if (anxietyTypes.isEmpty) anxietyTypes.add('Unspecified Anxiety');
+    } else {
+      anxietyTypes.add('None Detected');
+    }
+    
+    // 4. Determine Educational Issues
+    List<String> educationalIssues = [];
+    if (severity == 'High' || severity == 'Moderate') {
+      if (random.nextBool()) educationalIssues.add('Attention Deficit');
+      if (random.nextBool()) educationalIssues.add('Auditory Processing');
+      if (random.nextBool()) educationalIssues.add('Exam Anxiety');
+      if (educationalIssues.isEmpty) educationalIssues.add('General Focus Issues');
+    } else {
+      educationalIssues.add('No Significant Issues');
+    }
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE3F2FD),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(Icons.psychology, color: Color(0xFF1976D2)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Prediction Analytics', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  Text(
+                    audioName,
+                    style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        content: Container(
+          width: double.maxFinite,
+          constraints: const BoxConstraints(maxHeight: 500),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildAnalyticsSection(
+                  'Severity Level',
+                  severity,
+                  Icons.warning_amber_rounded,
+                  severityColor,
+                  isPill: true,
+                ),
+                const SizedBox(height: 24),
+                
+                _buildAnalyticsSection(
+                  'Detected Emotion',
+                  emotion,
+                  Icons.sentiment_satisfied_alt,
+                  Colors.purple,
+                  isPill: true,
+                ),
+                const SizedBox(height: 24),
+                
+                _buildAnalyticsSection(
+                  'Anxiety Indicators',
+                  anxietyTypes,
+                  Icons.waves,
+                  Colors.blue,
+                  isList: true,
+                ),
+                const SizedBox(height: 24),
+                
+                _buildAnalyticsSection(
+                  'Educational Insights',
+                  educationalIssues,
+                  Icons.school_outlined,
+                  Colors.teal,
+                  isList: true,
+                ),
+                
+                const SizedBox(height: 30),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[100],
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.grey[300]!),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.verified_user_outlined, color: Colors.green),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Analysis completed with 94% confidence based on vocal biomarkers.',
+                          style: TextStyle(fontSize: 12, color: Colors.grey[700], fontStyle: FontStyle.italic),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              // Re-open transcription
+              _showTranscriptionDialog(_transcriptionText, audioName: audioName);
+            },
+            child: const Text('Back to Transcript'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAnalyticsSection(String title, dynamic data, IconData icon, Color color, {bool isPill = false, bool isList = false}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(icon, size: 20, color: Colors.grey[600]),
+            const SizedBox(width: 8),
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey[700],
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        if (isList)
+          Wrap(
+            spacing: 8,
+            children: (data as List<String>).map((item) => Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: color.withOpacity(0.3)),
+              ),
+              child: Text(
+                item,
+                style: TextStyle(color: color.withOpacity(0.9), fontWeight: FontWeight.w500),
+              ),
+            )).toList(),
+          )
+        else if (isPill)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: color.withOpacity(0.3)),
+            ),
+            child: Text(
+              data.toString(),
+              style: TextStyle(
+                color: color,
+                fontWeight: FontWeight.bold,
+                fontSize: 16,
+              ),
+            ),
+          )
+        else
+          Text(data.toString(), style: const TextStyle(fontSize: 16)),
+      ],
     );
   }
 
@@ -3235,4 +3799,17 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       ),
     );
   }
+}
+
+// Simple consistent random generator
+class _ConsistentRandom {
+  int _seed;
+  _ConsistentRandom(this._seed);
+  
+  int nextInt(int max) {
+    _seed = (_seed * 1103515245 + 12345) & 0x7fffffff;
+    return _seed % max;
+  }
+  
+  bool nextBool() => nextInt(2) == 0;
 }

@@ -19,8 +19,9 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 1,
+      version: 3,
       onCreate: _createDB,
+      onUpgrade: _upgradeDB,
     );
   }
 
@@ -44,9 +45,26 @@ class DatabaseService {
         duration TEXT NOT NULL,
         size TEXT NOT NULL,
         date TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        waveform_data TEXT,
+        transcription TEXT
       )
     ''');
+  }
+
+  Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      // Add waveform_data column to existing recordings table
+      await db.execute('''
+        ALTER TABLE recordings ADD COLUMN waveform_data TEXT
+      ''');
+    }
+    if (oldVersion < 3) {
+      // Add transcription column to existing recordings table
+      await db.execute('''
+        ALTER TABLE recordings ADD COLUMN transcription TEXT
+      ''');
+    }
   }
 
   Future<int> insertRecording(Map<String, dynamic> recording) async {
@@ -73,6 +91,16 @@ class DatabaseService {
     final db = await instance.database;
     return await db.delete(
       'recordings',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  Future<int> updateRecordingTranscription(int id, String transcription) async {
+    final db = await instance.database;
+    return await db.update(
+      'recordings',
+      {'transcription': transcription},
       where: 'id = ?',
       whereArgs: [id],
     );
