@@ -8,6 +8,8 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../services/firebase_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 class WebDashboardScreen extends StatefulWidget {
   const WebDashboardScreen({super.key});
@@ -430,33 +432,72 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
             ),
             const SizedBox(width: 12),
-            Text('Uploading ${file.name}...'),
+            Text('Analyzing ${file.name} with AI Model...'),
           ],
         ),
         backgroundColor: const Color(0xFF2E7D32),
-        duration: const Duration(seconds: 30),
+        duration: const Duration(seconds: 60), // Longer duration for analysis
       ),
     );
     
     try {
-      // Read file as bytes
+      // 1. Read file as bytes
       final reader = html.FileReader();
       reader.readAsArrayBuffer(file);
-      
       await reader.onLoadEnd.first;
       
-      // Save recording metadata to Firestore
+      final audioBytes = reader.result as Uint8List;
+
+      // 2. Send to Python Backend (app.py)
+      // Note: Ensure app.py is running on port 5000
+      var request = http.MultipartRequest('POST', Uri.parse('http://127.0.0.1:5000/upload-audio'));
+      request.files.add(http.MultipartFile.fromBytes(
+        'audio', 
+        audioBytes,
+        filename: file.name
+      ));
+      request.fields['folder'] = folderName;
+      request.fields['transcript'] = ''; // Let backend handle transcription
+
+      print('Sending to Python Backend...');
+      var streamedResponse = await request.send();
+      var response = await http.Response.fromStream(streamedResponse);
+      
+      print('Response status: ${response.statusCode}');
+      
+      Map<String, dynamic> analysisResult = {};
+      if (response.statusCode == 200) {
+        analysisResult = jsonDecode(response.body);
+        print('Analysis success: $analysisResult');
+      } else {
+        print('Backend error: ${response.body}');
+        throw Exception("AI Analysis Failed: ${response.body}");
+      }
+      
+      // 3. Save recording metadata + Analysis to Firestore
       final now = DateTime.now();
-      final recordingRef = await FirebaseFirestore.instance.collection('recordings').add({
+      final severity = analysisResult['severity'] ?? {'level': 'Unknown', 'score': 0};
+      final emotion = analysisResult['emotion'] ?? {'label': 'Unknown', 'confidence': 0};
+      
+      await FirebaseFirestore.instance.collection('recordings').add({
         'folder_name': folderName,
         'name': file.name,
         'size': '${(file.size / 1024).toStringAsFixed(1)} KB',
         'date': '${_getMonthName(now.month)} ${now.day}, ${now.year}',
-        'duration': '00:00:00', // Would need audio processing to get actual duration
-        'transcription': '',
+        'duration': analysisResult['duration'] ?? '00:00:00', 
+        'transcription': analysisResult['transcript'] ?? '',
+        
+        // Analysis Data
+        'severity_level': severity['level'],
+        'severity_score': severity['score'],
+        'emotion_label': emotion['label'],
+        'emotion_confidence': emotion['confidence'],
+        'anxiety_indicators': analysisResult['anxiety_indicators'] ?? [],
+        'summary': analysisResult['summary'] ?? '',
+        
         'uploaded_at': FieldValue.serverTimestamp(),
-        'source': 'web_upload',
-        'admin_id': _currentAdminId, // Add admin_id for isolation
+        'source': 'web_upload_analyzed',
+        'admin_id': _currentAdminId,
       });
       
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -466,18 +507,20 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
             children: [
               const Icon(Icons.check_circle, color: Colors.white),
               const SizedBox(width: 12),
-              Text('${file.name} uploaded to $folderName'),
+              Text('Analysis Complete! Saved to $folderName'),
             ],
           ),
           backgroundColor: const Color(0xFF2E7D32),
         ),
       );
     } catch (e) {
+      print('Upload Error: $e');
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Error uploading: $e'),
+          content: Text('Error: $e. Is Python Server running?'),
           backgroundColor: Colors.red,
+          duration: const Duration(seconds: 5),
         ),
       );
     }

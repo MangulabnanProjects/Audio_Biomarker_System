@@ -49,3 +49,5 @@ android/app/google-services.json
 
 # Kotlin sessions
 android/.kotlin/
+
+serviceAccountKey.json

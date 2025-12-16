@@ -17,6 +17,13 @@ void main() async {
     options: DefaultFirebaseOptions.currentPlatform,
   );
   
+  // Enable persistent login across sessions
+  try {
+    await FirebaseAuth.instance.setPersistence(Persistence.LOCAL);
+  } catch (e) {
+    print("Error setting persistence: $e");
+  }
+  
   runApp(const MyApp());
 }
 

@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Biomarker Analysis</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #fff;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            padding: 30px 0;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            background: linear-gradient(90deg, #00d4ff, #7b2ff7);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #888;
+            font-size: 1.1rem;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .card h2 {
+            margin-bottom: 20px;
+            color: #00d4ff;
+        }
+
+        .recording-section {
+            text-align: center;
+        }
+
+        .mic-button {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: 4px solid #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 20px auto;
+            transition: all 0.3s;
+        }
+
+        .mic-button:hover {
+            transform: scale(1.05);
+            background: rgba(0, 212, 255, 0.2);
+        }
+
+        .mic-button.recording {
+            border-color: #ff4757;
+            background: rgba(255, 71, 87, 0.2);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4);
+            }
+
+            50% {
+                box-shadow: 0 0 0 20px rgba(255, 71, 87, 0);
+            }
+        }
+
+        .mic-icon {
+            font-size: 3rem;
+        }
+
+        .timer {
+            font-size: 2rem;
+            font-weight: bold;
+            margin: 15px 0;
+            font-family: monospace;
+        }
+
+        .recording-status {
+            font-size: 1.1rem;
+            color: #888;
+            margin-bottom: 15px;
+        }
+
+        .recording-status.active {
+            color: #ff4757;
+        }
+
+        .live-transcript-box {
+            background: rgba(0, 0, 0, 0.3);
+            border: 2px solid rgba(0, 212, 255, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 80px;
+            text-align: left;
+        }
+
+        .live-transcript-box h4 {
+            color: #00d4ff;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .live-indicator {
+            width: 10px;
+            height: 10px;
+            background: #ff4757;
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.3;
+            }
+        }
+
+        .live-transcript-text {
+            color: #ccc;
+            font-style: italic;
+            line-height: 1.6;
+            min-height: 40px;
+        }
+
+        .waveform {
+            height: 50px;
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+        }
+
+        .wave-bar {
+            width: 4px;
+            height: 20px;
+            background: #00d4ff;
+            border-radius: 2px;
+            transition: height 0.1s;
+        }
+
+        .analyze-btn {
+            background: linear-gradient(90deg, #00d4ff, #7b2ff7);
+            border: none;
+            padding: 15px 50px;
+            font-size: 1.1rem;
+            color: #fff;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: transform 0.3s, box-shadow 0.3s;
+            margin-top: 20px;
+            display: none;
+        }
+
+        .analyze-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.3);
+        }
+
+        .analyze-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .analyze-btn.visible {
+            display: inline-block;
+        }
+
+        .instructions {
+            background: rgba(0, 212, 255, 0.1);
+            padding: 15px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+
+        .instructions h3 {
+            color: #00d4ff;
+            margin-bottom: 10px;
+            font-size: 1rem;
+        }
+
+        .instructions p {
+            color: #aaa;
+            line-height: 1.5;
+            font-size: 0.95rem;
+        }
+
+        #results {
+            display: none;
+        }
+
+        .severity-card {
+            text-align: center;
+            padding: 40px;
+        }
+
+        .severity-level {
+            font-size: 3rem;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+
+        .severity-bar {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+
+        .severity-item {
+            padding: 10px 25px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+        }
+
+        .confidence {
+            font-size: 1.2rem;
+            color: #888;
+        }
+
+        .transcript-box {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 20px;
+            text-align: left;
+        }
+
+        .transcript-box h4 {
+            color: #00d4ff;
+            margin-bottom: 10px;
+        }
+
+        .transcript-box p {
+            color: #ccc;
+            font-style: italic;
+            line-height: 1.6;
+        }
+
+        .indicator {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-left: 4px solid;
+            transition: transform 0.2s;
+        }
+
+        .indicator:hover {
+            transform: translateX(5px);
+        }
+
+        .indicator.detected {
+            border-color: #ff6b6b;
+            background: rgba(255, 107, 107, 0.1);
+        }
+
+        .indicator.not-detected {
+            border-color: #4ecdc4;
+            background: rgba(78, 205, 196, 0.05);
+        }
+
+        .indicator-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .indicator-name {
+            font-size: 1.2rem;
+            font-weight: 600;
+        }
+
+        .indicator-prob {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .indicator-desc {
+            color: #aaa;
+            margin-bottom: 15px;
+        }
+
+        .tips-list {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 15px 15px 15px 35px;
+            border-radius: 8px;
+            margin-top: 10px;
+        }
+
+        .tips-list li {
+            margin-bottom: 8px;
+            color: #ccc;
+        }
+
+        .expand-btn {
+            background: none;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: #00d4ff;
+            padding: 5px 15px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+
+        .insights-panel {
+            display: none;
+            margin-top: 15px;
+        }
+
+        .summary-card {
+            background: linear-gradient(135deg, rgba(0, 212, 255, 0.1), rgba(123, 47, 247, 0.1));
+            border: 1px solid rgba(0, 212, 255, 0.3);
+        }
+
+        .summary-text {
+            font-size: 1.2rem;
+            line-height: 1.8;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top-color: #00d4ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            margin-left: 10px;
+        }
+
+        .badge-detected {
+            background: #ff6b6b;
+            color: #fff;
+        }
+
+        .badge-clear {
+            background: #4ecdc4;
+            color: #000;
+        }
+
+        .new-recording-btn {
+            background: transparent;
+            border: 2px solid #00d4ff;
+            color: #00d4ff;
+            padding: 10px 30px;
+            border-radius: 25px;
+            cursor: pointer;
+            margin-top: 30px;
+            font-size: 1rem;
+        }
+
+        .new-recording-btn:hover {
+            background: rgba(0, 212, 255, 0.1);
+        }
+
+        .error-msg {
+            color: #ff6b6b;
+            background: rgba(255, 107, 107, 0.1);
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>🧠 Audio Biomarker Analysis</h1>
+            <p class="subtitle">Real-time Mental Health Assessment</p>
+        </header>
+
+        <div class="card recording-section" id="recordingSection">
+            <h2>🎙️ Voice Recording</h2>
+
+            <div class="instructions">
+                <h3>How it works:</h3>
+                <p>Click the microphone OR Drop an audio file here</p>
+            </div>
+
+            <div id="dropZone" class="drop-zone" style="
+                border: 2px dashed rgba(0, 212, 255, 0.3);
+                border-radius: 15px;
+                padding: 20px;
+                margin-bottom: 20px;
+                text-align: center;
+                transition: all 0.3s ease;
+            ">
+                <p style="color: #aaa; margin: 0;">📂 Drag & Drop Audio File Here</p>
+            </div>
+
+            <!-- Folder Selection Modal -->
+            <div id="folderModal" class="modal" style="
+                display: none; 
+                position: fixed; 
+                z-index: 1000; 
+                left: 0; 
+                top: 0; 
+                width: 100%; 
+                height: 100%; 
+                background-color: rgba(0,0,0,0.8);
+                align-items: center; 
+                justify-content: center;
+            ">
+                <div class="modal-content" style="
+                    background: #16213e; 
+                    padding: 30px; 
+                    border-radius: 15px; 
+                    border: 1px solid #00d4ff; 
+                    width: 300px; 
+                    text-align: center;
+                ">
+                    <h3 style="color: #00d4ff; margin-bottom: 20px;">Select Destination Folder</h3>
+                    <input type="text" id="folderInput" placeholder="Enter Folder Name (e.g., Patient_A)" style="
+                        width: 100%; 
+                        padding: 10px; 
+                        margin-bottom: 20px; 
+                        border-radius: 5px; 
+                        border: 1px solid #333; 
+                        background: #1a1a2e; 
+                        color: #fff;
+                    ">
+                    <div style="display: flex; gap: 10px; justify-content: center;">
+                        <button onclick="confirmFolder()" style="
+                            background: #00d4ff; 
+                            color: #1a1a2e; 
+                            border: none; 
+                            padding: 10px 20px; 
+                            border-radius: 5px; 
+                            cursor: pointer; 
+                            font-weight: bold;
+                        ">Confirm</button>
+                        <button onclick="closeModal()" style="
+                            background: transparent; 
+                            color: #fff; 
+                            border: 1px solid #aaa; 
+                            padding: 10px 20px; 
+                            border-radius: 5px; 
+                            cursor: pointer;
+                        ">Cancel</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="waveform" id="waveform">
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+                <div class="wave-bar"></div>
+            </div>
+
+            <p class="recording-status" id="status">Click the microphone to start</p>
+            <div class="timer" id="timer">00:00</div>
+
+            <div class="mic-button" id="micBtn" onclick="toggleRecording()">
+                <span class="mic-icon">🎤</span>
+            </div>
+
+            <div class="live-transcript-box" id="liveTranscriptBox" style="display: none;">
+                <h4><span class="live-indicator"></span> Live Transcription</h4>
+                <p class="live-transcript-text" id="liveTranscriptText">Listening...</p>
+            </div>
+
+            <div class="error-msg" id="errorMsg"></div>
+
+            <button class="analyze-btn" id="analyzeBtn" onclick="analyzeRecording()">🔬 Analyze Recording</button>
+        </div>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Analyzing audio biomarkers...</p>
+            <p style="color: #666; font-size: 0.9rem; margin-top: 10px;">Extracting features...</p>
+        </div>
+
+        <div id="results">
+            <div class="card summary-card">
+                <h2>📋 Summary</h2>
+                <p class="summary-text" id="summary"></p>
+                <div class="transcript-box">
+                    <h4>📝 What you said</h4>
+                    <p id="transcript">"..."</p>
+                </div>
+            </div>
+
+            <div class="card severity-card">
+                <h2>⚠️ Severity Level</h2>
+                <div class="severity-level" id="severityLevel">-</div>
+                <div class="severity-bar" id="severityBar"></div>
+                <p id="severityRecommendation" style="margin-top: 20px; color: #aaa;"></p>
+            </div>
+
+            <!-- New Emotion Card -->
+            <div class="card" style="text-align: center;">
+                <h2>🎭 Detected Emotion</h2>
+                <div id="emotionDisplay" style="margin: 20px 0;">
+                    <span id="emotionIcon" style="font-size: 4rem;">😐</span>
+                    <h3 id="emotionLabel" style="font-size: 2rem; color: #00d4ff; margin-top: 10px;">Neutral</h3>
+                </div>
+                <p style="color: #aaa; font-style: italic;">Based on acoustic voice properties (tone, pitch, energy)</p>
+            </div>
+
+            <div class="card">
+                <h2>🎯 Anxiety Indicators</h2>
+                <div id="indicators"></div>
+            </div>
+
+            <!-- Confidence Pie Charts Section -->
+            <div class="card">
+                <h2>📊 Confidence Levels</h2>
+                <div style="display: flex; justify-content: center; gap: 60px; flex-wrap: wrap; margin: 30px 0;">
+
+                    <!-- Model Accuracy (Static 90%) -->
+                    <div style="text-align: center;">
+                        <div class="pie-chart" style="
+                            width: 160px;
+                            height: 160px;
+                            border-radius: 50%;
+                            background: conic-gradient(
+                                #00d4ff 0deg 324deg,
+                                rgba(255,255,255,0.1) 324deg 360deg
+                            );
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            box-shadow: 0 0 25px rgba(0, 212, 255, 0.3);
+                            margin: 0 auto;
+                        ">
+                            <div style="
+                                width: 115px;
+                                height: 115px;
+                                border-radius: 50%;
+                                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                flex-direction: column;
+                            ">
+                                <span style="font-size: 2rem; font-weight: bold; color: #00d4ff;">90%</span>
+                                <span style="font-size: 0.7rem; color: #888;">Model</span>
+                            </div>
+                        </div>
+                        <p style="color: #00d4ff; margin-top: 15px; font-weight: 600;">Model Accuracy</p>
+                        <p style="color: #666; font-size: 0.8rem;">Trained validation score</p>
+                    </div>
+
+                    <!-- Prediction Confidence (Dynamic) -->
+                    <div style="text-align: center;">
+                        <div id="predictionPieChart" class="pie-chart" style="
+                            width: 160px;
+                            height: 160px;
+                            border-radius: 50%;
+                            background: conic-gradient(
+                                #7b2ff7 0deg 252deg,
+                                rgba(255,255,255,0.1) 252deg 360deg
+                            );
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            box-shadow: 0 0 25px rgba(123, 47, 247, 0.3);
+                            margin: 0 auto;
+                        ">
+                            <div style="
+                                width: 115px;
+                                height: 115px;
+                                border-radius: 50%;
+                                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                                display: flex;
+                                align-items: center;
+                                justify-content: center;
+                                flex-direction: column;
+                            ">
+                                <span id="predictionConfidenceValue"
+                                    style="font-size: 1.8rem; font-weight: bold; color: #7b2ff7; margin-bottom: 2px;">70%</span>
+                                <span style="font-size: 0.7rem; color: #888; line-height: 1;">Prediction</span>
+                            </div>
+                        </div>
+                        <p style="color: #7b2ff7; margin-top: 15px; font-weight: 600;">Prediction Confidence</p>
+                        <p style="color: #666; font-size: 0.8rem;">Current analysis certainty</p>
+                    </div>
+
+                </div>
+                <div style="display: flex; justify-content: center; gap: 40px; margin-top: 10px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="width: 12px; height: 12px; background: #00d4ff; border-radius: 2px;"></div>
+                        <span style="color: #888; font-size: 0.85rem;">Model Accuracy</span>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="width: 12px; height: 12px; background: #7b2ff7; border-radius: 2px;"></div>
+                        <span style="color: #888; font-size: 0.85rem;">Prediction Confidence</span>
+                    </div>
+                </div>
+            </div>
+
+            <div style="text-align: center;">
+                <button class="new-recording-btn" onclick="newRecording()">🎙️ New Recording</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let audioContext;
+        let mediaStream;
+        let audioChunks = [];
+        let isRecording = false;
+        let timerInterval;
+        let seconds = 0;
+        let audioBlob = null; // Store the recorded or dropped blob
+        let liveTranscript = '';
+        let recognition;
+        let analyzerNode;
+        let scriptProcessor;
+        let mediaRecorder; // Added for potential future use, though not used in current recording logic
+        let droppedFile = null; // Store dropped file explicitly
+
+        // Drag & Drop Logic
+        const dropZone = document.getElementById('dropZone');
+        const folderModal = document.getElementById('folderModal');
+        const folderInput = document.getElementById('folderInput');
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.style.background = 'rgba(0, 212, 255, 0.1)';
+            dropZone.style.borderColor = '#00d4ff';
+        });
+
+        dropZone.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            dropZone.style.background = 'transparent';
+            dropZone.style.borderColor = 'rgba(0, 212, 255, 0.3)';
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.style.background = 'transparent';
+            dropZone.style.borderColor = 'rgba(0, 212, 255, 0.3)';
+            console.log("File dropped!"); // DEBUG
+
+            if (e.dataTransfer.files.length > 0) {
+                droppedFile = e.dataTransfer.files[0];
+                console.log("File details:", droppedFile.name, droppedFile.type); // DEBUG
+
+                // Check if audio (Relaxed validation)
+                const validExtensions = ['.wav', '.mp3', '.m4a', '.ogg', '.webm'];
+                const isAudioType = droppedFile.type.startsWith('audio/');
+                const hasValidExtension = validExtensions.some(ext => droppedFile.name.toLowerCase().endsWith(ext));
+
+                if (isAudioType || hasValidExtension) {
+                    // Open Modal
+                    console.log("Opening modal..."); // DEBUG
+                    folderModal.style.display = 'flex';
+                    folderInput.value = ''; // Clear previous
+                    folderInput.focus();
+                } else {
+                    console.log("Invalid file type"); // DEBUG
+                    showError("Please drop a valid audio file.");
+                }
+            }
+        });
+
+
+        // WAV encoder helper
+        function encodeWAV(samples, sampleRate) {
+            const buffer = new ArrayBuffer(44 + samples.length * 2);
+            const view = new DataView(buffer);
+
+            function writeString(view, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + samples.length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, samples.length * 2, true);
+
+            const offset = 44;
+            for (let i = 0; i < samples.length; i++) {
+                const s = Math.max(-1, Math.min(1, samples[i]));
+                view.setInt16(offset + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+
+            return new Blob([buffer], { type: 'audio/wav' });
+        }
+
+        function initSpeechRecognition() {
+            if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                recognition = new SpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                recognition.lang = 'fil-PH'; // Support Taglish
+
+                recognition.onresult = (event) => {
+                    let interim = '';
+                    let final = '';
+
+                    for (let i = 0; i < event.results.length; i++) {
+                        if (event.results[i].isFinal) {
+                            final += event.results[i][0].transcript + ' ';
+                        } else {
+                            interim += event.results[i][0].transcript;
+                        }
+                    }
+
+                    liveTranscript = final.trim();
+                    document.getElementById('liveTranscriptText').textContent =
+                        (final + interim) || 'Listening...';
+                };
+
+                recognition.onerror = (event) => {
+                    console.log('Speech recognition error:', event.error);
+                };
+
+                return true;
+            }
+            return false;
+        }
+
+        async function toggleRecording() {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                await startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                analyzerNode = audioContext.createAnalyser();
+                analyzerNode.fftSize = 256;
+
+                // Use ScriptProcessor to capture raw audio data
+                scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                audioChunks = [];
+
+                scriptProcessor.onaudioprocess = (e) => {
+                    if (isRecording) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        audioChunks.push(new Float32Array(inputData));
+                    }
+                };
+
+                source.connect(analyzerNode);
+                source.connect(scriptProcessor);
+                scriptProcessor.connect(audioContext.destination);
+
+                isRecording = true;
+                seconds = 0;
+                liveTranscript = '';
+
+                visualize();
+
+                if (initSpeechRecognition()) {
+                    try { recognition.start(); } catch (e) { }
+                }
+
+                document.getElementById('micBtn').classList.add('recording');
+                document.getElementById('status').textContent = 'Recording... Click to stop';
+                document.getElementById('status').classList.add('active');
+                document.getElementById('analyzeBtn').classList.remove('visible');
+                document.getElementById('liveTranscriptBox').style.display = 'block';
+                document.getElementById('liveTranscriptText').textContent = 'Listening...';
+                document.getElementById('errorMsg').style.display = 'none';
+
+                timerInterval = setInterval(() => {
+                    seconds++;
+                    const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
+                    const secs = (seconds % 60).toString().padStart(2, '0');
+                    document.getElementById('timer').textContent = `${mins}:${secs}`;
+                }, 1000);
+
+            } catch (err) {
+                showError('Could not access microphone. Please allow microphone access.');
+                console.error(err);
+            }
+        }
+
+        function stopRecording() {
+            isRecording = false;
+
+            if (recognition) {
+                try { recognition.stop(); } catch (e) { }
+            }
+
+            clearInterval(timerInterval);
+
+            // Combine all audio chunks
+            const totalLength = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
+            const combinedSamples = new Float32Array(totalLength);
+            let offset = 0;
+            for (const chunk of audioChunks) {
+                combinedSamples.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            // Create WAV blob
+            audioBlob = encodeWAV(combinedSamples, audioContext.sampleRate);
+
+            // Cleanup
+            if (scriptProcessor) scriptProcessor.disconnect();
+            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+
+            document.getElementById('micBtn').classList.remove('recording');
+            document.getElementById('status').textContent = 'Recording complete! Click Analyze.';
+            document.getElementById('status').classList.remove('active');
+            document.getElementById('analyzeBtn').classList.add('visible');
+
+            if (liveTranscript) {
+                document.getElementById('liveTranscriptText').textContent = liveTranscript;
+            }
+
+            document.querySelectorAll('.wave-bar').forEach(bar => bar.style.height = '20px');
+        }
+
+        function visualize() {
+            if (!isRecording) return;
+
+            const bufferLength = analyzerNode.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyzerNode.getByteFrequencyData(dataArray);
+
+            const bars = document.querySelectorAll('.wave-bar');
+            const step = Math.floor(bufferLength / bars.length);
+
+            bars.forEach((bar, i) => {
+                const value = dataArray[i * step];
+                const height = Math.max(5, (value / 255) * 45);
+                bar.style.height = `${height}px`;
+            });
+
+            requestAnimationFrame(visualize);
+        }
+
+        function showError(msg) {
+            const errorEl = document.getElementById('errorMsg');
+            errorEl.textContent = msg;
+            errorEl.style.display = 'block';
+        }
+
+        async function analyzeRecording() {
+            if (!audioBlob) {
+                showError("No recording found. Please record audio first.");
+                return;
+            }
+
+            // Open Folder Selection Modal for Live Recording too
+            droppedFile = null; // Ensure this is null so confirmFolder knows it's a live blob
+            folderModal.style.display = 'flex';
+            folderInput.value = '';
+            folderInput.focus();
+        }
+
+        // Updated confirmFolder to handle both Dropped Files and Live Recordings
+        async function confirmFolder() {
+            const folderName = folderInput.value.trim() || 'Uncategorized';
+            folderModal.style.display = 'none';
+
+            showError(""); // Clear errors
+            document.getElementById('recordingSection').style.display = 'none';
+            document.getElementById('loading').style.display = 'block';
+
+            if (droppedFile) {
+                // Process dropped file
+                document.getElementById('status').innerText = `Analyzing: ${droppedFile.name}`;
+                await processAudio(droppedFile, folderName);
+            } else if (audioBlob) {
+                // Process live recording
+                document.getElementById('status').innerText = `Analyzing Recording...`;
+                await processAudio(audioBlob, folderName);
+            }
+        }
+
+        function displayResults(data) {
+            document.getElementById('results').style.display = 'block';
+            document.getElementById('summary').textContent = data.summary;
+            document.getElementById('transcript').textContent = data.transcript ? `"${data.transcript}"` : '"(No speech detected)"';
+
+            const severity = data.severity;
+            const info = severity.info;
+            document.getElementById('severityLevel').textContent = severity.level;
+            document.getElementById('severityLevel').style.color = info.color;
+            // Severity confidence display removed as requested
+            document.getElementById('severityRecommendation').textContent = info.recommendation;
+
+            const severityBar = document.getElementById('severityBar');
+            severityBar.innerHTML = '';
+            for (const [level, prob] of Object.entries(severity.probabilities)) {
+                const item = document.createElement('div');
+                item.className = 'severity-item';
+                item.style.background = level === severity.level ? info.color : 'rgba(255,255,255,0.1)';
+                item.style.color = level === severity.level ? '#000' : '#888';
+                item.textContent = `${level}`;
+                severityBar.appendChild(item);
+            }
+
+            // Update Prediction Confidence Pie Chart
+            // Use severty confidence or emotion confidence, whichever is available/higher
+            let predConfidence = severity.confidence || 0;
+            if (data.emotion && data.emotion.confidence && data.emotion.confidence > predConfidence) {
+                predConfidence = data.emotion.confidence;
+            }
+            // Ensure it's a number between 0-100
+            predConfidence = Math.round(predConfidence);
+
+            const predPie = document.getElementById('predictionPieChart');
+            const predValue = document.getElementById('predictionConfidenceValue');
+
+            // Calculate degrees for conic gradient (3.6 degrees per 1%)
+            const degrees = Math.round(predConfidence * 3.6);
+
+            predPie.style.background = `conic-gradient(#7b2ff7 0deg ${degrees}deg, rgba(255,255,255,0.1) ${degrees}deg 360deg)`;
+            predValue.textContent = `${predConfidence}%`;
+
+            // Display Detected Emotion
+            if (data.emotion) {
+                const emotionMap = {
+                    'Neutral': '😐', 'Happy': '😊', 'Angry': '😠',
+                    'Sad': '😢', 'Fear': '😨', 'Disgust': '🤢', 'Surprise': '😲'
+                };
+                const emoji = emotionMap[data.emotion.label] || '😐';
+                document.getElementById('emotionIcon').textContent = emoji;
+                document.getElementById('emotionLabel').textContent = data.emotion.label;
+                // Emotion confidence display removed as requested
+            }
+
+            const indicatorsDiv = document.getElementById('indicators');
+            indicatorsDiv.innerHTML = '';
+
+            data.anxiety_indicators.forEach((ind, idx) => {
+                const div = document.createElement('div');
+                div.className = `indicator ${ind.detected ? 'detected' : 'not-detected'}`;
+                div.innerHTML = `
+                    <div class="indicator-header">
+                        <span class="indicator-name">${ind.name}
+                            <span class="badge ${ind.detected ? 'badge-detected' : 'badge-clear'}">${ind.detected ? 'DETECTED' : 'CLEAR'}</span>
+                        </span>
+                    </div>
+                    <p class="indicator-desc">${ind.insights.description || ''}</p>
+                    <button class="expand-btn" onclick="toggleInsights(${idx})">View Educational Insights</button>
+                    <div class="insights-panel" id="insights-${idx}">
+                        <h4 style="margin: 10px 0; color: #00d4ff;">💡 Tips</h4>
+                        <ul class="tips-list">${(ind.insights.tips || []).map(tip => `<li>${tip}</li>`).join('')}</ul>
+                        <h4 style="margin: 10px 0; color: #00d4ff;">📚 Resources</h4>
+                        <ul class="tips-list">${(ind.insights.resources || []).map(r => `<li>${r}</li>`).join('')}</ul>
+                    </div>
+                `;
+                indicatorsDiv.appendChild(div);
+            });
+        }
+
+        function toggleInsights(idx) {
+            const panel = document.getElementById(`insights-${idx}`);
+            panel.style.display = panel.style.display === 'none' || !panel.style.display ? 'block' : 'none';
+        }
+
+        function newRecording() {
+            audioBlob = null;
+            seconds = 0;
+            liveTranscript = '';
+            audioChunks = [];
+            document.getElementById('timer').textContent = '00:00';
+            document.getElementById('status').textContent = 'Click the microphone to start';
+            document.getElementById('analyzeBtn').classList.remove('visible');
+            document.getElementById('liveTranscriptBox').style.display = 'none';
+            document.getElementById('recordingSection').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('errorMsg').style.display = 'none';
+        }
+    </script>
+</body>
+
+</html>
