@@ -1,0 +1,13 @@
+flask
+flask-cors
+firebase-admin
+numpy
+scipy
+joblib
+scikit-learn
+librosa
+pydub
+transformers
+torch
+requests
+SpeechRecognition

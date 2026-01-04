@@ -13,15 +13,26 @@ import 'screens/web_admin_login_stub.dart'
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
   
-  // Enable persistent login across sessions
+  // Initialize Firebase (avoid duplicate initialization error)
   try {
-    await FirebaseAuth.instance.setPersistence(Persistence.LOCAL);
+    if (Firebase.apps.isEmpty) {
+      await Firebase.initializeApp(
+        options: DefaultFirebaseOptions.currentPlatform,
+      );
+    }
   } catch (e) {
-    print("Error setting persistence: $e");
+    print("Firebase initialization error: $e");
+  }
+  
+  // Enable persistent login across sessions (web only)
+  if (kIsWeb) {
+    try {
+      await FirebaseAuth.instance.setPersistence(Persistence.LOCAL);
+      print('✅ Firebase persistence set to LOCAL');
+    } catch (e) {
+      print("⚠️ Error setting persistence (may already be set): $e");
+    }
   }
   
   runApp(const MyApp());

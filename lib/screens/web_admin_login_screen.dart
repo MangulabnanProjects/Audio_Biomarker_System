@@ -12,39 +12,65 @@ class WebAdminLoginScreen extends StatefulWidget {
 
 class _WebAdminLoginScreenState extends State<WebAdminLoginScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _identifierController = TextEditingController();
+  final _codeController = TextEditingController();
+  final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _isLoading = false;
   bool _isPasswordVisible = false;
+  bool _useCodeLogin = true; // Default to code-only login
 
-  Future<void> _login() async {
+  Future<void> _loginWithCode() async {
+    if (_codeController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please enter your Admin Code'),
+          backgroundColor: Colors.orange,
+          behavior: SnackBarBehavior.floating,
+          width: 400,
+        ),
+      );
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    final user = await FirebaseService.loginWithCode(_codeController.text.trim());
+
+    setState(() => _isLoading = false);
+
+    if (user == null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Invalid Admin Code. Please check and try again.'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+          width: 400,
+        ),
+      );
+    }
+  }
+
+  Future<void> _loginWithEmail() async {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isLoading = true);
 
     final user = await FirebaseService.loginAdmin(
-      identifier: _identifierController.text.trim(),
+      identifier: _emailController.text.trim(),
       password: _passwordController.text,
     );
 
     setState(() => _isLoading = false);
 
-    if (user != null) {
-      // Main.dart StreamBuilder checks auth state, 
-      // but we can also manually navigate if needed, 
-      // though typically StreamBuilder handles it.
-      // On Web, a full reload might happen, so let the stream handle it.
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Login failed. Check your ID/Email and Password.'),
-            backgroundColor: Colors.red,
-            behavior: SnackBarBehavior.floating,
-            width: 400,
-          ),
-        );
-      }
+    if (user == null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Login failed. Check your Email and Password.'),
+          backgroundColor: Colors.red,
+          behavior: SnackBarBehavior.floating,
+          width: 400,
+        ),
+      );
     }
   }
 
@@ -79,7 +105,7 @@ class _WebAdminLoginScreenState extends State<WebAdminLoginScreen> {
                       bottomLeft: Radius.circular(24),
                     ),
                     image: DecorationImage(
-                      image: NetworkImage("https://images.unsplash.com/photo-1557683316-973673baf926?ixlib=rb-4.0.3&auto=format&fit=crop&w=1000&q=80"), // Placeholder abstract
+                      image: NetworkImage("https://images.unsplash.com/photo-1557683316-973673baf926?ixlib=rb-4.0.3&auto=format&fit=crop&w=1000&q=80"),
                       fit: BoxFit.cover,
                       opacity: 0.1,
                     ),
@@ -118,69 +144,107 @@ class _WebAdminLoginScreenState extends State<WebAdminLoginScreen> {
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(60.0),
-                  child: Form(
-                    key: _formKey,
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text(
-                          'Admin Sign In',
-                          style: TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF263238),
-                          ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text(
+                        'Admin Sign In',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF263238),
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Enter your credentials to access the dashboard',
-                          style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _useCodeLogin 
+                            ? 'Enter your Admin Code to access the dashboard'
+                            : 'Enter your email and password',
+                        style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                      ),
+                      const SizedBox(height: 24),
+                      
+                      // Toggle between Code and Email login
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.grey[100],
+                          borderRadius: BorderRadius.circular(12),
                         ),
-                        const SizedBox(height: 40),
-                        
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: GestureDetector(
+                                onTap: () => setState(() => _useCodeLogin = true),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  decoration: BoxDecoration(
+                                    color: _useCodeLogin ? const Color(0xFF2E7D32) : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Text(
+                                    'Code Login',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: _useCodeLogin ? Colors.white : Colors.grey[600],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: GestureDetector(
+                                onTap: () => setState(() => _useCodeLogin = false),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 12),
+                                  decoration: BoxDecoration(
+                                    color: !_useCodeLogin ? const Color(0xFF2E7D32) : Colors.transparent,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Text(
+                                    'Email Login',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      color: !_useCodeLogin ? Colors.white : Colors.grey[600],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 32),
+                      
+                      // CODE LOGIN FORM
+                      if (_useCodeLogin) ...[
                         TextFormField(
-                          controller: _identifierController,
+                          controller: _codeController,
                           decoration: InputDecoration(
-                            labelText: 'Email or Admin ID',
-                            prefixIcon: const Icon(Icons.person_outline),
+                            labelText: 'Admin Code',
+                            hintText: 'e.g. 2026-1234',
+                            prefixIcon: const Icon(Icons.key, color: Color(0xFF2E7D32)),
                             border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                             enabledBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12),
                               borderSide: BorderSide(color: Colors.grey[300]!),
                             ),
-                          ),
-                          validator: (value) => value!.isEmpty ? 'Required' : null,
-                          onFieldSubmitted: (_) => _login(),
-                        ),
-                        const SizedBox(height: 20),
-                        
-                        TextFormField(
-                          controller: _passwordController,
-                          obscureText: !_isPasswordVisible,
-                          decoration: InputDecoration(
-                            labelText: 'Password',
-                            prefixIcon: const Icon(Icons.lock_outline),
-                            suffixIcon: IconButton(
-                              icon: Icon(_isPasswordVisible ? Icons.visibility_off : Icons.visibility),
-                              onPressed: () => setState(() => _isPasswordVisible = !_isPasswordVisible),
-                            ),
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                            enabledBorder: OutlineInputBorder(
+                            focusedBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12),
-                              borderSide: BorderSide(color: Colors.grey[300]!),
+                              borderSide: const BorderSide(color: Color(0xFF2E7D32), width: 2),
                             ),
                           ),
-                          validator: (value) => value!.isEmpty ? 'Required' : null,
-                          onFieldSubmitted: (_) => _login(),
+                          style: const TextStyle(fontSize: 18, letterSpacing: 2, fontWeight: FontWeight.bold),
+                          textAlign: TextAlign.center,
+                          onFieldSubmitted: (_) => _loginWithCode(),
                         ),
-                        
-                        const SizedBox(height: 32),
-                        
+                        const SizedBox(height: 24),
                         SizedBox(
                           height: 50,
                           child: ElevatedButton(
-                            onPressed: _isLoading ? null : _login,
+                            onPressed: _isLoading ? null : _loginWithCode,
                             style: ElevatedButton.styleFrom(
                               backgroundColor: const Color(0xFF2E7D32),
                               foregroundColor: Colors.white,
@@ -188,43 +252,104 @@ class _WebAdminLoginScreenState extends State<WebAdminLoginScreen> {
                             ),
                             child: _isLoading
                                 ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                                : const Text('Sign In', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                                : const Text('Sign In with Code', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                           ),
                         ),
-                        
-                        const SizedBox(height: 32),
-                        Container(
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFE3F2FD),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: const Color(0xFF90CAF9).withOpacity(0.5)),
-                          ),
-                          child: Row(
+                      ],
+                      
+                      // EMAIL LOGIN FORM
+                      if (!_useCodeLogin) ...[
+                        Form(
+                          key: _formKey,
+                          child: Column(
                             children: [
-                              const Icon(Icons.info_outline, color: Color(0xFF1976D2)),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Need an account?',
-                                      style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1565C0), fontSize: 13),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      'Please download the "Audio" mobile app to create an admin account and generate your ID.',
-                                      style: TextStyle(color: Colors.grey[800], fontSize: 12),
-                                    ),
-                                  ],
+                              TextFormField(
+                                controller: _emailController,
+                                decoration: InputDecoration(
+                                  labelText: 'Email',
+                                  prefixIcon: const Icon(Icons.email_outlined),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                    borderSide: BorderSide(color: Colors.grey[300]!),
+                                  ),
+                                ),
+                                validator: (value) => value!.isEmpty ? 'Required' : null,
+                                onFieldSubmitted: (_) => _loginWithEmail(),
+                              ),
+                              const SizedBox(height: 20),
+                              TextFormField(
+                                controller: _passwordController,
+                                obscureText: !_isPasswordVisible,
+                                decoration: InputDecoration(
+                                  labelText: 'Password',
+                                  prefixIcon: const Icon(Icons.lock_outline),
+                                  suffixIcon: IconButton(
+                                    icon: Icon(_isPasswordVisible ? Icons.visibility_off : Icons.visibility),
+                                    onPressed: () => setState(() => _isPasswordVisible = !_isPasswordVisible),
+                                  ),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                  enabledBorder: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                    borderSide: BorderSide(color: Colors.grey[300]!),
+                                  ),
+                                ),
+                                validator: (value) => value!.isEmpty ? 'Required' : null,
+                                onFieldSubmitted: (_) => _loginWithEmail(),
+                              ),
+                              const SizedBox(height: 24),
+                              SizedBox(
+                                width: double.infinity,
+                                height: 50,
+                                child: ElevatedButton(
+                                  onPressed: _isLoading ? null : _loginWithEmail,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF2E7D32),
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  child: _isLoading
+                                      ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                                      : const Text('Sign In', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                                 ),
                               ),
                             ],
                           ),
                         ),
                       ],
-                    ),
+                      
+                      const SizedBox(height: 32),
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE8F5E9),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFF81C784).withOpacity(0.5)),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.info_outline, color: Color(0xFF2E7D32)),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text(
+                                    'Need an account?',
+                                    style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF1B5E20), fontSize: 13),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Download the "Audio" mobile app to create an admin account. You\'ll receive a code like 2026-XXXX to login here.',
+                                    style: TextStyle(color: Colors.grey[800], fontSize: 12),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),

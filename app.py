@@ -169,29 +169,34 @@ def index():
 
 @app.route('/upload-audio', methods=['POST'])
 def upload_audio():
-    """Handle audio upload and extraction"""
+    """Handle audio upload, transcribe, extract features, and predict"""
     try:
         if 'audio' not in request.files:
-            return jsonify({'error': 'No audio file provided'}), 400
+            return jsonify({'success': False, 'error': 'No audio file provided'}), 400
         
         audio_file = request.files['audio']
         if audio_file.filename == '':
-            return jsonify({'error': 'No audio file selected'}), 400
+            return jsonify({'success': False, 'error': 'No audio file selected'}), 400
         
-        # Get transcript from frontend (live transcription) & Folder
-        live_transcript = request.form.get('transcript', '')
-        folder_name = request.form.get('folder', 'Uncategorized')
-        
-        # Save audio to temp file (browser sends WAV format)
+        # Save audio to temp file
         temp_path = os.path.join(UPLOAD_FOLDER, f'recording_{os.getpid()}.wav')
         audio_file.save(temp_path)
-        print(f"Audio saved to: {temp_path}")
-        print(f"Live transcript received: '{live_transcript[:100] if live_transcript else 'None'}...'")
-        print(f"Selected Folder: {folder_name}")
+        print(f"📥 Audio saved: {temp_path} ({os.path.getsize(temp_path)} bytes)")
         
-        # Extract features (use live transcript if provided)
+        # Step 1: Transcribe with AssemblyAI
+        print("🎤 Transcribing audio...")
+        transcript = transcribe_audio(temp_path)
+        print(f"📝 Transcript: {transcript[:200]}...")
+        
+        # Step 2: Extract features
+        print("🔬 Extracting features...")
         from audio_features import extract_all_features
-        features, transcript = extract_all_features(temp_path, transcript_override=live_transcript if live_transcript else None)
+        features, _ = extract_all_features(temp_path, transcript_override=transcript)
+        
+        # Step 3: Run prediction
+        print("🧠 Running prediction...")
+        model = load_model()
+        result = run_prediction(features, model)
         
         # Clean up temp file
         try:
@@ -199,32 +204,87 @@ def upload_audio():
         except:
             pass
         
-        # Run prediction
-        model = load_model()
-        result = run_prediction(features, model)
-        result['transcript'] = transcript
-        result['folder'] = folder_name
+        # Format response for frontend
+        response = {
+            'success': True,
+            'transcript': transcript,
+            'severity_level': result.get('severity', {}).get('level', 'Normal'),
+            'severity_confidence': result.get('severity', {}).get('confidence', 0),
+            'emotion': result.get('emotion', {}).get('label', 'Neutral'),
+            'indicators': [
+                {
+                    'name': ind.get('name', ''),
+                    'probability': ind.get('probability', 0),
+                    'detected': ind.get('detected', False)
+                }
+                for ind in result.get('anxiety_indicators', [])
+                if ind.get('detected', False)
+            ][:8],  # Top 8 detected indicators
+            'features': features  # Return full feature set for saving
+        }
         
-        # Save to Firebase
-        if db is not None:
-            try:
-                # Add timestamp
-                import datetime
-                result['timestamp'] = datetime.datetime.now()
-                
-                # Save to specific folder in 'recordings' collection or structured via subcollections
-                # For now, saving to 'recordings' with a 'folder' field
-                db.collection('recordings').add(result)
-                print(f"Result saved to Firebase (Folder: {folder_name})")
-            except Exception as fb_err:
-                print(f"Failed to save to Firebase: {fb_err}")
-        
-        return jsonify(result)
+        print(f"✅ Analysis complete: {response['severity_level']}")
+        return jsonify(response)
         
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def transcribe_audio(audio_path):
+    """Transcribe audio using AssemblyAI"""
+    import requests
+    import time
+    
+    # YOUR ASSEMBLYAI API KEY
+    ASSEMBLYAI_API_KEY = "YOUR_API_KEY_HERE"  # Replace with actual key
+    
+    if ASSEMBLYAI_API_KEY == "YOUR_API_KEY_HERE":
+        return "[Transcription disabled - Add AssemblyAI API key]"
+    
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
+    
+    try:
+        # Upload audio file
+        with open(audio_path, 'rb') as f:
+            upload_response = requests.post(
+                "https://api.assemblyai.com/v2/upload",
+                headers=headers,
+                files={'file': f}
+            )
+        audio_url = upload_response.json()['upload_url']
+        
+        # Request transcription
+        transcript_request = {
+            "audio_url": audio_url,
+            "language_code": "tl"  # Tagalog
+        }
+        transcript_response = requests.post(
+            "https://api.assemblyai.com/v2/transcript",
+            json=transcript_request,
+            headers=headers
+        )
+        transcript_id = transcript_response.json()['id']
+        
+        # Poll for completion
+        while True:
+            status_response = requests.get(
+                f"https://api.assemblyai.com/v2/transcript/{transcript_id}",
+                headers=headers
+            )
+            status = status_response.json()['status']
+            
+            if status == 'completed':
+                return status_response.json()['text']
+            elif status == 'error':
+                return "[Transcription error]"
+            
+            time.sleep(2)
+            
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return "[No transcription available]"
+
 
 def run_prediction(features, model):
     """Run model prediction with extracted features"""

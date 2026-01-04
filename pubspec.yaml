@@ -63,6 +63,7 @@ dependencies:
   http: ^1.1.0
   pdf: ^3.11.3
   printing: ^5.14.2
+  firebase_storage: ^12.4.10
 
 dev_dependencies:
   flutter_test:

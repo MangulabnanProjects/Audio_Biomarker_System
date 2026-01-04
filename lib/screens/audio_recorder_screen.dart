@@ -8,6 +8,8 @@ import '../services/audio_recorder_service.dart';
 import '../services/firebase_service.dart';
 import '../services/database_service.dart'; // Import DatabaseService
 import '../services/assemblyai_service.dart';
+import '../services/audio_biomarker_service.dart';
+import '../models/biomarker_result.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:path_provider/path_provider.dart';
 import '../widgets/waveform_visualizer.dart';
@@ -73,6 +75,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   Duration _totalDuration = Duration.zero;
   List<double>? _currentWaveformData; // Waveform data for currently playing audio
   String? _currentTranscription; // Transcription for currently playing audio
+  String? _currentRecordingName; // Name of current/last recording
   int? _currentPlayingId; // Database ID of currently playing audio
   // Stream Subscriptions
   StreamSubscription? _positionSubscription;
@@ -91,8 +94,6 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   @override
   void initState() {
     super.initState();
-    _checkPermission();
-    _setupAmplitudeListener();
     _allFolders = {};
     _allFolders = {};
     _allFolders = {};
@@ -121,6 +122,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   }
   
   Future<void> _initializeApp() async {
+    await AudioBiomarkerService.loadConfig();
     _currentAdminId = await FirebaseService.getCurrentAdminId();
     print('🔑 Current Admin ID: $_currentAdminId');
     await _loadData();
@@ -128,8 +130,8 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
   
   Future<void> _loadData() async {
     try {
-      // 1. Load from Local Database (SQLite) - Primary Source
-      final localRecordings = await DatabaseService.instance.getAllRecordings();
+      // 1. Load from Local Database (SQLite) - Filtered by Admin ID
+      final localRecordings = await DatabaseService.instance.getAllRecordings(adminId: _currentAdminId);
       
       Map<String, List<Map<String, String>>> loadedFolders = {};
       Set<String> folderNames = {};
@@ -163,11 +165,15 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       // Filter by Admin ID
       List<Map<String, dynamic>> clientInfos = [];
       if (_currentAdminId != null) {
+        print('🔎 Fetching client info for admin_id: "$_currentAdminId"');
         clientInfos = await FirebaseService.getAllClientInfo(_currentAdminId!);
+        print('🔎 Firebase returned ${clientInfos.length} client records');
+      } else {
+        print('⚠️ _currentAdminId is null, cannot fetch client info!');
       }
 
-      // 1b. Load Folders from Local Database (Metadata)
-      final localFolders = await DatabaseService.instance.getAllFolders();
+      // 1b. Load Folders from Local Database (Metadata) - Filtered by Admin ID
+      final localFolders = await DatabaseService.instance.getAllFolders(adminId: _currentAdminId);
       for (var folder in localFolders) {
         String name = folder['name'] as String;
         folderNames.add(name);
@@ -198,20 +204,39 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
            }
 
           if (!loadedMetadata.containsKey(folderName)) {
+            // Parse birthday safely - might be null or wrong type
+            DateTime? birthday;
+            try {
+              final birthdayData = info['birthday'];
+              if (birthdayData is Timestamp) {
+                birthday = birthdayData.toDate();
+              }
+            } catch (e) {
+              print('Warning: Could not parse birthday for $folderName: $e');
+            }
+            
             loadedMetadata[folderName] = {
-              'name': info['full_name'],
-              'age': info['age'].toString(),
-              'year': info['school_year'],
-              'gender': info['gender'],
-              'phone': info['phone_number'],
-              'address': info['address'],
-              'birthday': (info['birthday'] as Timestamp).toDate(),
+              'name': info['full_name'] ?? '',
+              'age': (info['age'] ?? '').toString(),
+              'year': info['school_year'] ?? '',
+              'gender': info['gender'] ?? '',
+              'phone': info['phone_number'] ?? '',
+              'address': info['address'] ?? '',
+              'birthday': birthday,
             };
           }
         }
       }
 
       // Load complete - no default folders
+      
+      // DEBUG: Log what was loaded
+      print('📂 Loaded ${loadedFolders.length} folders from local DB');
+      print('👤 Loaded ${clientInfos.length} client infos from Firebase');
+      print('📋 Loaded ${loadedMetadata.length} folder metadata entries');
+      for (var key in loadedMetadata.keys) {
+        print('   - Folder "$key" has metadata: ${loadedMetadata[key]?['name']}');
+      }
 
       // 4. Update UI
       if (mounted) {
@@ -240,6 +265,455 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         _currentLevel = level;
       });
     });
+  }
+
+  /// Run biomarker analysis after transcription
+  Future<void> _runBiomarkerAnalysis(String audioPath, String transcription, {String? recordingFirebaseId}) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(
+        child: Card(
+          child: Padding(
+            padding: EdgeInsets.all(20.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Analyzing biomarkers...'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    
+    try {
+      final result = await AudioBiomarkerService.analyzeAudio(audioPath, transcription);
+      if (mounted) Navigator.of(context).pop();
+      
+      if (result.success) {
+        _showBiomarkerResultsDialog(result);
+        
+        // Save to Firebase
+        if (_currentAdminId != null) {
+          await _saveBiomarkerToFirebase(result, audioPath, recordingFirebaseId: recordingFirebaseId);
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Analysis error: ${result.error ?? "Unknown error"}')),
+          );
+        }
+      }
+    } catch (e) {
+      print('❌ Biomarker analysis error: $e');
+      if (mounted) Navigator.of(context).pop();
+    }
+  }
+
+  /// Save biomarker results to Firebase
+  Future<void> _saveBiomarkerToFirebase(BiomarkerResult result, String audioPath, {String? recordingFirebaseId}) async {
+    try {
+      final fileName = audioPath.split('/').last;
+      final docId = await FirebaseService.saveBiomarkerResult(
+        recordingId: fileName.replaceAll('.m4a', ''), // Use name as ID for now
+        folderName: _sessionDetails['folder'] ?? 'Uncategorized',
+        fileName: fileName, // Save full filename for linking
+        adminId: _currentAdminId!,
+        transcript: result.transcript,
+        severity: {
+          'level': result.severity.level,
+          'confidence': result.severity.confidence,
+          'probabilities': result.severity.probabilities,
+        },
+        emotion: {
+          'label': result.emotion.label,
+          'confidence': result.emotion.confidence,
+        },
+        anxietyIndicators: result.anxietyIndicators.map((i) => {
+          'name': i.name,
+          'detected': i.detected,
+          'probability': i.probability,
+          'threshold': i.threshold,
+        }).toList(),
+        detectedConditions: result.detectedConditions,
+        summary: result.summary,
+        processingTimeMs: result.processingTimeMs,
+        extractedFeatures: result.features,
+      );
+      
+      // Save extracted features to subcollection if available
+      if (docId != null && result.features != null) {
+        await FirebaseService.saveExtractedFeatures(docId, result.features!);
+      }
+      
+      // ALSO save to recording document if ID provided
+      if (recordingFirebaseId != null && result.features != null) {
+        await FirebaseService.saveFeaturesToRecording(recordingFirebaseId, result.features!);
+      }
+    } catch (e) {
+      print('Error saving biomarker to Firebase: $e');
+    }
+  }
+
+  /// Show simplified biomarker results dialog (pill-style design)
+  void _showBiomarkerResultsDialog(BiomarkerResult result) {
+    // Get severity display and color
+    String getSeverityDisplay(String level) {
+      switch (level) {
+        case 'Normal': return 'Low';
+        case 'Moderate': return 'Moderate';
+        case 'Severe': return 'High';
+        default: return level;
+      }
+    }
+    
+    Color getSeverityColor(String level) {
+      switch (level) {
+        case 'Normal': return const Color(0xFF4CAF50);
+        case 'Moderate': return const Color(0xFFFF9800);
+        case 'Severe': return const Color(0xFFF44336);
+        default: return const Color(0xFF4CAF50);
+      }
+    }
+    
+    Color getSeverityBgColor(String level) {
+      return getSeverityColor(level).withOpacity(0.15);
+    }
+    
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF2196F3).withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(Icons.analytics, color: Color(0xFF2196F3), size: 24),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Prediction Analytics',
+                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                        ),
+                        Text(
+                          _currentRecordingName ?? 'Recording',
+                          style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              
+              const SizedBox(height: 24),
+              
+              // Severity Level
+              Row(
+                children: [
+                  Icon(Icons.warning_amber, color: Colors.grey[600], size: 18),
+                  const SizedBox(width: 8),
+                  Text('Severity Level', style: TextStyle(fontSize: 14, color: Colors.grey[700])),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: getSeverityBgColor(result.severity.level),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: getSeverityColor(result.severity.level).withOpacity(0.3)),
+                ),
+                child: Text(
+                  getSeverityDisplay(result.severity.level),
+                  style: TextStyle(
+                    color: getSeverityColor(result.severity.level),
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
+                ),
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Detected Emotion
+              Row(
+                children: [
+                  Icon(Icons.mood, color: Colors.grey[600], size: 18),
+                  const SizedBox(width: 8),
+                  Text('Detected Emotion', style: TextStyle(fontSize: 14, color: Colors.grey[700])),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF9C27B0).withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: const Color(0xFF9C27B0).withOpacity(0.3)),
+                ),
+                child: Text(
+                  result.emotion.label,
+                  style: const TextStyle(
+                    color: Color(0xFF9C27B0),
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
+                ),
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Anxiety Indicators - CLICKABLE
+              Row(
+                children: [
+                  Icon(Icons.psychology_alt, color: Colors.grey[600], size: 18),
+                  const SizedBox(width: 8),
+                  Text('High Confidence Indicators (>80%)', style: TextStyle(fontSize: 14, color: Colors.grey[700])),
+                ],
+              ),
+              const SizedBox(height: 8),
+              GestureDetector(
+                onTap: () {
+                  final highConfidence = result.anxietyIndicators.where((i) => i.probability >= 80).toList();
+                  if (highConfidence.isNotEmpty) {
+                    _showAnxietyDetailsDialog(highConfidence);
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF03A9F4).withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: const Color(0xFF03A9F4).withOpacity(0.3)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        result.anxietyIndicators.where((i) => i.probability >= 80).isEmpty ? 'None Detected' : 
+                          '${result.anxietyIndicators.where((i) => i.probability >= 80).length} Detected',
+                        style: const TextStyle(
+                          color: Color(0xFF03A9F4),
+                          fontWeight: FontWeight.w600,
+                          fontSize: 16,
+                        ),
+                      ),
+                      if (result.anxietyIndicators.where((i) => i.probability >= 80).isNotEmpty) ...[
+                        const SizedBox(width: 4),
+                        const Icon(Icons.info_outline, color: Color(0xFF03A9F4), size: 16),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Educational Insights
+              Row(
+                children: [
+                  Icon(Icons.school, color: Colors.grey[600], size: 18),
+                  const SizedBox(width: 8),
+                  Text('Educational Insights', style: TextStyle(fontSize: 14, color: Colors.grey[700])),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF009688).withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: const Color(0xFF009688).withOpacity(0.3)),
+                ),
+                child: Text(
+                  result.severity.level == 'Normal' ? 'No Significant Issues' : 'Review Recommended',
+                  style: const TextStyle(
+                    color: Color(0xFF009688),
+                    fontWeight: FontWeight.w600,
+                    fontSize: 16,
+                  ),
+                ),
+              ),
+              
+              const SizedBox(height: 24),
+              
+              // Confidence Footer
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.verified_user, color: Colors.green[600], size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Analysis completed with ${result.severity.confidence}% confidence based on vocal biomarkers.',
+                        style: TextStyle(fontSize: 12, color: Colors.grey[700], fontStyle: FontStyle.italic),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Action Buttons
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                      if (_currentTranscription != null) {
+                        _showTranscriptionDialog(_currentTranscription!);
+                      }
+                    },
+                    child: const Text(
+                      'Back to Transcript',
+                      style: TextStyle(color: Color(0xFF4CAF50), fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                  ElevatedButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF4CAF50),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                    ),
+                    child: const Text('Done', style: TextStyle(fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Show detailed anxiety indicators with explanations
+  void _showAnxietyDetailsDialog(List<AnxietyIndicator> indicators) {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          constraints: const BoxConstraints(maxWidth: 500, maxHeight: 600),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.psychology_alt, color: Color(0xFF03A9F4)),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Anxiety Indicators',
+                      style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                ],
+              ),
+              const Divider(),
+              const SizedBox(height: 8),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: indicators.length,
+                  itemBuilder: (context, index) {
+                    final indicator = indicators[index];
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      elevation: 2,
+                      child: ExpansionTile(
+                        leading: Icon(
+                          indicator.detected ? Icons.warning : Icons.check_circle_outline,
+                          color: indicator.detected ? Colors.orange : Colors.green,
+                        ),
+                        title: Text(
+                          indicator.name,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        subtitle: Text('${indicator.probability}% probability'),
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (indicator.insights.description.isNotEmpty) ...[
+                                  const Text(
+                                    'Description:',
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    indicator.insights.description,
+                                    style: const TextStyle(fontSize: 13),
+                                  ),
+                                  const SizedBox(height: 12),
+                                ],
+                                if (indicator.insights.tips.isNotEmpty) ...[
+                                  const Text(
+                                    'Tips:',
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  ...indicator.insights.tips.map((tip) => Padding(
+                                    padding: const EdgeInsets.only(left: 8, bottom: 4),
+                                    child: Row(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        const Text('• ', style: TextStyle(fontSize: 16)),
+                                        Expanded(child: Text(tip.toString(), style: const TextStyle(fontSize: 13))),
+                                      ],
+                                    ),
+                                  )).toList(),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
 
@@ -297,6 +771,9 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
 
       // Start duration timer
       _startTimer();
+      
+      // Start amplitude listener for visualization
+      _setupAmplitudeListener();
     } else {
       setState(() {
         _statusMessage = 'Failed to start recording. Please grant microphone permission.';
@@ -309,6 +786,8 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
 
   Future<void> _stopRecording() async {
     final path = await _audioService.stopRecording();
+    _amplitudeSubscription?.cancel(); // Stop listening to amplitude
+    
     final duration = _recordingDuration; // Capture duration before reset
     
     // Capture waveform data before resetting
@@ -350,14 +829,16 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
           size: sizeStr,
           date: dateStr,
           adminId: _currentAdminId!, // Pass Admin ID
+          waveform: waveformData, // Pass waveform data
         );
       }
       
-      // Save to Local Database (CRITICAL for persistence)
+      // Save to Local Database (CRITICAL for persistence) - Include Admin ID
       final dbId = await DatabaseService.instance.insertRecording({
         'file_name': fileName,
         'file_path': path,
         'folder_name': folderName,
+        'admin_id': _currentAdminId ?? '',
         'duration': durationStr,
         'size': sizeStr,
         'date': dateStr,
@@ -432,7 +913,11 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         // Update transcription text
         setState(() {
           _transcriptionText = transcription;
+          _currentTranscription = transcription;
+          _currentRecordingName = path.split('/').last;
         });
+        
+        String? recordingFirebaseId;
         
         // Save transcription to database
         final String folderName = _sessionDetails['folder'] ?? 'Uncategorized';
@@ -443,8 +928,16 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
           final recording = _allFolders[folderName]![0];
           print('🔍 Recording data: $recording');
           
-          final recordingId = int.tryParse(recording['id'] ?? '');
-          final firebaseDocId = recording['firebase_id'];
+          int? recordingId;
+          String? firebaseDocId;
+          
+          try {
+            final idVal = recording['id'];
+            recordingId = int.tryParse(idVal?.toString() ?? '');
+            firebaseDocId = recording['firebase_id'];
+          } catch (e) {
+             print('Error parsing IDs: $e');
+          }
           
           print('🔍 Recording ID: $recordingId');
           print('🔍 Firebase Doc ID: "$firebaseDocId"');
@@ -458,6 +951,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
           
           // Also save to Firebase if we have a Firebase document ID
           if (firebaseDocId != null && firebaseDocId.toString().isNotEmpty) {
+            recordingFirebaseId = firebaseDocId; // Capture ID for analysis linkage
             final success = await FirebaseService.updateRecordingTranscription(firebaseDocId, transcription);
             print('☁️ Firebase sync result: $success for document: $firebaseDocId');
           } else {
@@ -469,7 +963,8 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         
         // Show result popup
         if (mounted) {
-          _showTranscriptionDialog(transcription);
+          // Run biomarker analysis after successful transcription
+          await _runBiomarkerAnalysis(path, transcription, recordingFirebaseId: recordingFirebaseId);
         }
       } catch (e) {
         print('❌ Transcription error: $e');
@@ -702,8 +1197,13 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   _isDeleteMode = false; // Exit delete mode after deletion
                 });
                 
-                // Delete from Local DB
-                await DatabaseService.instance.deleteFolder(folderName);
+                // Delete from Local DB (with admin filter)
+                await DatabaseService.instance.deleteFolder(folderName, adminId: _currentAdminId);
+                
+                // Also delete client_info from Firebase if exists
+                if (_currentAdminId != null) {
+                  await FirebaseService.deleteClientInfoByFolder(folderName, _currentAdminId!);
+                }
                 
                 ScaffoldMessenger.of(context).showSnackBar(
                   SnackBar(
@@ -751,7 +1251,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   await DatabaseService.instance.deleteRecording(dbId);
                 }
 
-                // 2. Delete Physical File
+                // 2. Delete from Firebase (if firebase_id exists)
                 try {
                   if (_allFolders.containsKey(folderName)) {
                     final fileData = _allFolders[folderName]?.firstWhere(
@@ -759,6 +1259,14 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                       orElse: () => {},
                     );
                     
+                    // Delete from Firebase using stored firebase_id
+                    final firebaseId = fileData?['firebase_id'];
+                    if (firebaseId != null && firebaseId.isNotEmpty) {
+                      await FirebaseService.deleteRecording(firebaseId);
+                      print('✅ Deleted recording from Firebase: $firebaseId');
+                    }
+                    
+                    // 3. Delete Physical File
                     if (fileData != null && fileData.isNotEmpty && fileData.containsKey('path')) {
                       final file = File(fileData['path']!);
                       if (await file.exists()) {
@@ -1022,9 +1530,20 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
               actions: [
                 TextButton(
                   onPressed: () {
-                    // Cancel: Go to Home instead of Record
+                    // Cancel: Clear all fields and go to Home
                     Navigator.of(context).pop();
                     setState(() {
+                      // Clear all form fields
+                      _folderController.clear();
+                      _nameController.clear();
+                      _ageController.clear();
+                      _phoneController.clear();
+                      _addressController.clear();
+                      _birthdayController.clear();
+                      _selectedGender = null;
+                      _selectedSchoolYear = null;
+                      _selectedBirthday = null;
+                      
                       _selectedNavIndex = 0; // Go to Home
                     });
                   },
@@ -1182,6 +1701,7 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                       if (folderName != null && folderName.isNotEmpty) {
                          await DatabaseService.instance.insertFolder({
                             'name': folderName,
+                            'admin_id': _currentAdminId ?? '',
                             'created_at': DateTime.now().toIso8601String(),
                           });
                       }
@@ -1222,6 +1742,11 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
       leading: const Icon(Icons.folder, size: 20, color: Colors.grey),
       title: Text(name, style: const TextStyle(fontSize: 14)),
       onTap: () {
+        // DEBUG: Log folder metadata check
+        print('🔍 Clicked folder: "$name"');
+        print('   _folderMetadata keys: ${_folderMetadata.keys.toList()}');
+        print('   Has metadata for "$name"? ${_folderMetadata.containsKey(name)}');
+        
         // Check if we have metadata for this folder (Bypass Logic)
         if (_folderMetadata.containsKey(name)) {
           final data = _folderMetadata[name]!;
@@ -3390,30 +3915,52 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     );
   }
 
-  Widget _buildSuggestedQuestion(String question) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Padding(
-            padding: EdgeInsets.only(top: 2),
-            child: Icon(
-              Icons.arrow_right,
-              color: Color(0xFF2E7D32),
-              size: 20,
+  // About/Settings Page
+
+  // Show dialog to configure server URL
+  void _showServerSettingsDialog() {
+    final TextEditingController controller = TextEditingController(text: AudioBiomarkerService.baseUrl);
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Server Connection'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter the address of your Python server.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              question,
-              style: TextStyle(
-                fontSize: 13,
-                color: Colors.grey[700],
-                height: 1.4,
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'Server URL',
+                hintText: 'http://192.168.0.x:5001',
+                border: OutlineInputBorder(),
               ),
             ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              await AudioBiomarkerService.saveConfig(controller.text);
+              if (mounted) {
+                Navigator.of(context).pop();
+                setState(() {}); // Rebuild to show new URL
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Server URL updated to ${controller.text}')),
+                );
+              }
+            },
+            child: const Text('Save'),
           ),
         ],
       ),
@@ -3465,7 +4012,12 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   ],
                 ),
               ),
-            
+            ListTile(
+                leading: const Icon(Icons.settings_ethernet, color: Color(0xFF2E7D32)),
+                title: const Text('Server Connection'),
+                subtitle: Text(AudioBiomarkerService.baseUrl),
+                onTap: _showServerSettingsDialog,
+              ),
             ListTile(
               leading: const Icon(Icons.info, color: Color(0xFF2E7D32)),
               title: const Text('Version'),
@@ -3531,57 +4083,90 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
     );
   }
 
-  void _showPredictionAnalytics(String audioName) {
-    // Generate consistent dummy data based on recording name hash
-    final int seed = audioName.hashCode;
-    final random = _ConsistentRandom(seed);
+  void _showPredictionAnalytics(String audioName) async {
+    // Show loading indicator
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const Center(child: CircularProgressIndicator()),
+    );
     
-    // 1. Determine Severity (High, Moderate, Low)
-    final severityRoll = random.nextInt(100);
-    String severity;
-    Color severityColor;
-    if (severityRoll < 30) {
-      severity = 'High';
-      severityColor = Colors.red;
-    } else if (severityRoll < 70) {
-      severity = 'Moderate';
-      severityColor = Colors.orange;
-    } else {
-      severity = 'Low';
-      severityColor = Colors.green;
-    }
-    
-    // 2. Determine Emotion based on Severity
-    String emotion;
-    if (severity == 'High') {
-      emotion = ['Fearful', 'Angry', 'Sad'][random.nextInt(3)];
-    } else if (severity == 'Moderate') {
-      emotion = ['Anxious', 'Surprised', 'Disgust'][random.nextInt(3)];
-    } else {
-      emotion = ['Calm', 'Happy', 'Neutral'][random.nextInt(3)];
-    }
-    
-    // 3. Determine Anxiety Types based on emotion/severity
+    // Fetch real data from Firebase based on audio recording
+    String severity = 'Unknown';
+    Color severityColor = Colors.grey;
+    String emotion = 'Unknown';
     List<String> anxietyTypes = [];
-    if (severity != 'Low') {
-      if (random.nextBool()) anxietyTypes.add('Generalized Anxiety');
-      if (random.nextBool()) anxietyTypes.add('Social Anxiety');
-      if (random.nextBool()) anxietyTypes.add('Panic Disorder');
-      if (anxietyTypes.isEmpty) anxietyTypes.add('Unspecified Anxiety');
-    } else {
-      anxietyTypes.add('None Detected');
+    List<String> educationalIssues = [];
+    int confidencePercent = 0;
+    
+    try {
+      // Find biomarker result for this recording
+      final snapshot = await FirebaseFirestore.instance
+          .collection('biomarker_results')
+          .where('admin_id', isEqualTo: _currentAdminId)
+          .get();
+      
+      Map<String, dynamic>? matchingResult;
+      for (var doc in snapshot.docs) {
+        final data = doc.data();
+        // Match by recording name in file_name or folder_name
+        final fileName = data['file_name']?.toString() ?? '';
+        final folderName = data['folder_name']?.toString() ?? '';
+        if (fileName.contains(audioName) || audioName.contains(fileName) || 
+            folderName.contains(audioName) || audioName.contains(folderName)) {
+          matchingResult = data;
+          break;
+        }
+      }
+      
+      if (matchingResult != null) {
+        // Extract Severity
+        final severityData = matchingResult['severity'] as Map<String, dynamic>? ?? {};
+        severity = severityData['level']?.toString() ?? 'Normal';
+        confidencePercent = (severityData['confidence'] as num?)?.toInt() ?? 0;
+        
+        if (severity.toLowerCase() == 'severe') {
+          severityColor = Colors.red;
+        } else if (severity.toLowerCase() == 'moderate') {
+          severityColor = Colors.orange;
+        } else {
+          severityColor = Colors.green;
+        }
+        
+        // Extract Emotion
+        final emotionData = matchingResult['emotion'] as Map<String, dynamic>? ?? {};
+        emotion = emotionData['label']?.toString() ?? 'Neutral';
+        
+        // Extract Anxiety Indicators (only detected ones)
+        final indicators = matchingResult['anxiety_indicators'] as List<dynamic>? ?? [];
+        for (var indicator in indicators) {
+          final name = indicator['name']?.toString() ?? '';
+          final detected = indicator['detected'] == true;
+          final probability = (indicator['probability'] as num?)?.toInt() ?? 0;
+          
+          // Separate educational issues from anxiety types
+          const educationalNames = {'Impostor Syndrome', 'Academic Burnout', 'Perfectionism', 
+                                    'Fear Of Failure', 'Fear of Failure', 'Test Anxiety'};
+          
+          if (detected && name.isNotEmpty) {
+            if (educationalNames.contains(name)) {
+              educationalIssues.add('$name ($probability%)');
+            } else {
+              anxietyTypes.add('$name ($probability%)');
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('Error fetching biomarker results: $e');
     }
     
-    // 4. Determine Educational Issues
-    List<String> educationalIssues = [];
-    if (severity == 'High' || severity == 'Moderate') {
-      if (random.nextBool()) educationalIssues.add('Attention Deficit');
-      if (random.nextBool()) educationalIssues.add('Auditory Processing');
-      if (random.nextBool()) educationalIssues.add('Exam Anxiety');
-      if (educationalIssues.isEmpty) educationalIssues.add('General Focus Issues');
-    } else {
-      educationalIssues.add('No Significant Issues');
-    }
+    // Close loading dialog
+    if (mounted) Navigator.of(context).pop();
+    
+    // Set defaults if empty
+    if (anxietyTypes.isEmpty) anxietyTypes.add('None Detected');
+    if (educationalIssues.isEmpty) educationalIssues.add('No Significant Issues');
 
     showDialog(
       context: context,
@@ -3655,27 +4240,127 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
                   isList: true,
                 ),
                 
-                const SizedBox(height: 30),
+                // Analysis Confidence Bar
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
-                    color: Colors.grey[100],
+                    color: Colors.grey[50],
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(color: Colors.grey[300]!),
                   ),
-                  child: Row(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Icon(Icons.verified_user_outlined, color: Colors.green),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          'Analysis completed with 94% confidence based on vocal biomarkers.',
-                          style: TextStyle(fontSize: 12, color: Colors.grey[700], fontStyle: FontStyle.italic),
+                      Row(
+                        children: [
+                          const Icon(Icons.verified_user_outlined, color: Colors.green, size: 20),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Analysis Confidence',
+                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.grey[800]),
+                          ),
+                          const Spacer(),
+                          Text(
+                            confidencePercent > 0 ? '$confidencePercent%' : 'N/A',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: confidencePercent >= 70 
+                                  ? Colors.green 
+                                  : confidencePercent >= 40 
+                                      ? Colors.orange 
+                                      : Colors.red,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: LinearProgressIndicator(
+                          value: confidencePercent > 0 ? confidencePercent / 100 : 0,
+                          minHeight: 12,
+                          backgroundColor: Colors.grey[300],
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            confidencePercent >= 70 
+                                ? Colors.green 
+                                : confidencePercent >= 40 
+                                    ? Colors.orange 
+                                    : Colors.red,
+                          ),
                         ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        confidencePercent > 0 
+                            ? 'Analysis completed with ${confidencePercent >= 70 ? 'high' : confidencePercent >= 40 ? 'moderate' : 'low'} confidence based on vocal biomarkers.'
+                            : 'Analysis results from vocal biomarker detection.',
+                        style: TextStyle(fontSize: 11, color: Colors.grey[600], fontStyle: FontStyle.italic),
                       ),
                     ],
                   ),
                 ),
+                
+                // Tips & Recommendations Section
+                if (anxietyTypes.isNotEmpty || educationalIssues.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F8E9),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFF8BC34A)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.lightbulb_outline, color: Color(0xFF689F38), size: 20),
+                            const SizedBox(width: 8),
+                            const Text(
+                              'Suggested Tips',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF689F38),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        const Divider(height: 1, color: Color(0xFF8BC34A)),
+                        const SizedBox(height: 12),
+                        ...(() {
+                          List<String> allTips = [];
+                          // Collect tips from detected anxiety and educational issues
+                          for (String condition in [...anxietyTypes, ...educationalIssues]) {
+                            if (condition != 'No Significant Issues') {
+                              String conditionKey = condition.replaceAll(' ', '_');
+                              // This would ideally come from Firebase, but for now show placeholders
+                              allTips.add('• $condition: Practice stress management techniques');
+                            }
+                          }
+                          if (allTips.isEmpty) {
+                            allTips.add('• Maintain healthy lifestyle habits');
+                            allTips.add('• Continue regular wellness practices');
+                          }
+                          return allTips.take(5).map((tip) => Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              tip,
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey[800],
+                                height: 1.4,
+                              ),
+                            ),
+                          )).toList();
+                        })(),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -3796,6 +4481,35 @@ class _AudioRecorderScreenState extends State<AudioRecorderScreen> {
         onTap: () {
           // TODO: Implement setting action
         },
+      ),
+    );
+  }
+
+  /// Build a suggested question item
+  Widget _buildSuggestedQuestion(String question) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF5F5F5),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFFE0E0E0)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.lightbulb_outline, size: 16, color: Color(0xFF2E7D32)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              question,
+              style: TextStyle(
+                fontSize: 13,
+                color: Colors.grey[700],
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

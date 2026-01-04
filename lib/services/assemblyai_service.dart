@@ -78,7 +78,7 @@ class AssemblyAIService {
         },
         body: jsonEncode({
           'audio_url': audioUrl,
-          'language_code': 'en', // English/Taglish
+          'language_code': 'tl', // Tagalog
         }),
       );
       

@@ -19,29 +19,32 @@ class DatabaseService {
 
     return await openDatabase(
       path,
-      version: 3,
+      version: 4, // Upgraded for admin_id support
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
   }
 
   Future<void> _createDB(Database db, int version) async {
-    // Table for Metadata/Folders configuration (if needed later)
+    // Table for Metadata/Folders configuration
     await db.execute('''
       CREATE TABLE folders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        created_at TEXT
+        name TEXT NOT NULL,
+        admin_id TEXT NOT NULL,
+        created_at TEXT,
+        UNIQUE(name, admin_id)
       )
     ''');
 
-    // Table for Recordings
+    // Table for Recordings - now with admin_id
     await db.execute('''
       CREATE TABLE recordings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_name TEXT NOT NULL,
         file_path TEXT NOT NULL,
         folder_name TEXT NOT NULL,
+        admin_id TEXT NOT NULL,
         duration TEXT NOT NULL,
         size TEXT NOT NULL,
         date TEXT NOT NULL,
@@ -54,26 +57,45 @@ class DatabaseService {
 
   Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
-      // Add waveform_data column to existing recordings table
       await db.execute('''
         ALTER TABLE recordings ADD COLUMN waveform_data TEXT
       ''');
     }
     if (oldVersion < 3) {
-      // Add transcription column to existing recordings table
       await db.execute('''
         ALTER TABLE recordings ADD COLUMN transcription TEXT
       ''');
     }
+    if (oldVersion < 4) {
+      // Add admin_id column to existing tables
+      await db.execute('''
+        ALTER TABLE recordings ADD COLUMN admin_id TEXT DEFAULT ''
+      ''');
+      await db.execute('''
+        ALTER TABLE folders ADD COLUMN admin_id TEXT DEFAULT ''
+      ''');
+    }
   }
+
+  // ============ Recording Methods (Filtered by Admin) ============
 
   Future<int> insertRecording(Map<String, dynamic> recording) async {
     final db = await instance.database;
     return await db.insert('recordings', recording);
   }
 
-  Future<List<Map<String, dynamic>>> getRecordings(String folderName) async {
+  Future<List<Map<String, dynamic>>> getRecordings(String folderName, {String? adminId}) async {
     final db = await instance.database;
+    
+    if (adminId != null && adminId.isNotEmpty) {
+      return await db.query(
+        'recordings',
+        where: 'folder_name = ? AND admin_id = ?',
+        whereArgs: [folderName, adminId],
+        orderBy: 'created_at DESC',
+      );
+    }
+    
     return await db.query(
       'recordings',
       where: 'folder_name = ?',
@@ -82,8 +104,19 @@ class DatabaseService {
     );
   }
 
-  Future<List<Map<String, dynamic>>> getAllRecordings() async {
+  /// Get all recordings for a specific admin
+  Future<List<Map<String, dynamic>>> getAllRecordings({String? adminId}) async {
     final db = await instance.database;
+    
+    if (adminId != null && adminId.isNotEmpty) {
+      return await db.query(
+        'recordings', 
+        where: 'admin_id = ?',
+        whereArgs: [adminId],
+        orderBy: 'created_at DESC',
+      );
+    }
+    
     return await db.query('recordings', orderBy: 'created_at DESC');
   }
 
@@ -106,27 +139,50 @@ class DatabaseService {
     );
   }
 
-  // Folder Methods
+  // ============ Folder Methods (Filtered by Admin) ============
+
   Future<int> insertFolder(Map<String, dynamic> folder) async {
     final db = await instance.database;
     return await db.insert(
       'folders', 
       folder,
-      conflictAlgorithm: ConflictAlgorithm.replace, // Replace if exists (update metadata)
+      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
-  Future<List<Map<String, dynamic>>> getAllFolders() async {
+  /// Get all folders for a specific admin
+  Future<List<Map<String, dynamic>>> getAllFolders({String? adminId}) async {
     final db = await instance.database;
+    
+    if (adminId != null && adminId.isNotEmpty) {
+      return await db.query(
+        'folders',
+        where: 'admin_id = ?',
+        whereArgs: [adminId],
+        orderBy: 'created_at DESC',
+      );
+    }
+    
     return await db.query('folders', orderBy: 'created_at DESC');
   }
 
-  Future<int> deleteFolder(String folderName) async {
+  Future<int> deleteFolder(String folderName, {String? adminId}) async {
     final db = await instance.database;
     
-    // Also delete associated recordings? 
-    // For now, let's keep it simple, just delete the folder entry.
-    // The UI handles deleting files.
+    if (adminId != null && adminId.isNotEmpty) {
+      // Delete folder and its recordings for this admin
+      await db.delete(
+        'recordings',
+        where: 'folder_name = ? AND admin_id = ?',
+        whereArgs: [folderName, adminId],
+      );
+      
+      return await db.delete(
+        'folders',
+        where: 'name = ? AND admin_id = ?',
+        whereArgs: [folderName, adminId],
+      );
+    }
     
     return await db.delete(
       'folders',
@@ -140,3 +196,4 @@ class DatabaseService {
     db.close();
   }
 }
+

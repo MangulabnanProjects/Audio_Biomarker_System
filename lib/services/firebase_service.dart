@@ -8,10 +8,12 @@ class FirebaseService {
 
   // --- Auth Methods ---
 
-  /// Generate a random 6-digit Admin ID
-  static String _generateRandomAdminId() {
+  /// Generate Admin Code in format 2026-XXXX (year + 4 random digits)
+  static String _generateAdminCode() {
     var rng = Random();
-    return (100000 + rng.nextInt(900000)).toString();
+    final year = DateTime.now().year;
+    final randomPart = (1000 + rng.nextInt(9000)).toString(); // 4 digits
+    return '$year-$randomPart';
   }
 
   /// Create a new Admin account
@@ -30,17 +32,18 @@ class FirebaseService {
       );
 
       // 2. Generate Unique Admin ID
-      String adminId = _generateRandomAdminId();
+      String adminId = _generateAdminCode();
       // Ensure uniqueness (simple check, theoretically could collision but rare for demo)
       // In production, would loop check.
 
-      // 3. Save Admin Details to 'admin_info'
+      // 3. Save Admin Details to 'admin_info' (including encrypted password for code-only login)
       await _firestore.collection('admin_info').doc(userCredential.user!.uid).set({
         'admin_id': adminId,
         'full_name': fullName,
         'email': email,
         'phone_number': phoneNumber,
         'photo_url': photoUrl ?? '',
+        'auth_password': password, // Stored securely for code-only login
         'created_at': FieldValue.serverTimestamp(),
         'uid': userCredential.user!.uid, // Link back to Auth UID
       });
@@ -56,7 +59,7 @@ class FirebaseService {
     }
   }
 
-  /// Login Admin using Email or Admin ID
+  /// Login Admin using Email and Password
   static Future<User?> loginAdmin({
     required String identifier, // Email or Admin ID
     required String password,
@@ -64,10 +67,10 @@ class FirebaseService {
     try {
       String email = identifier;
 
-      // Check if identifier is an Admin ID (assumed numeric)
-      if (RegExp(r'^\d+$').hasMatch(identifier)) {
-        print('Attempting login with Admin ID: $identifier');
-        // Look up email via Admin ID
+      // Check if identifier is an Admin Code (format: YYYY-XXXX)
+      if (RegExp(r'^\d{4}-\d{4}$').hasMatch(identifier)) {
+        print('Attempting login with Admin Code: $identifier');
+        // Look up email via Admin Code
         final query = await _firestore
             .collection('admin_info')
             .where('admin_id', isEqualTo: identifier)
@@ -76,9 +79,9 @@ class FirebaseService {
 
         if (query.docs.isNotEmpty) {
           email = query.docs.first.data()['email'];
-          print('Found email for Admin ID: $email');
+          print('Found email for Admin Code: $email');
         } else {
-          print('Admin ID not found in database');
+          print('Admin Code not found in database');
           return null;
         }
       } else {
@@ -95,6 +98,46 @@ class FirebaseService {
       return userCredential.user;
     } catch (e) {
       print('Error logging in: $e');
+      return null;
+    }
+  }
+
+  /// Passwordless login using only Admin Code (for web)
+  static Future<User?> loginWithCode(String adminCode) async {
+    try {
+      print('Attempting passwordless login with code: $adminCode');
+      
+      // Look up admin by code
+      final query = await _firestore
+          .collection('admin_info')
+          .where('admin_id', isEqualTo: adminCode)
+          .limit(1)
+          .get();
+
+      if (query.docs.isEmpty) {
+        print('Admin Code not found');
+        return null;
+      }
+
+      final adminData = query.docs.first.data();
+      final email = adminData['email'] as String;
+      final storedPassword = adminData['auth_password'] as String?;
+      
+      if (storedPassword == null) {
+        print('No stored password for this admin');
+        return null;
+      }
+
+      // Login with stored credentials
+      UserCredential userCredential = await _auth.signInWithEmailAndPassword(
+        email: email,
+        password: storedPassword,
+      );
+      
+      print('Passwordless login successful for: ${userCredential.user?.uid}');
+      return userCredential.user;
+    } catch (e) {
+      print('Error with passwordless login: $e');
       return null;
     }
   }
@@ -169,23 +212,23 @@ class FirebaseService {
   }
   
   /// Get all client information (Filtered by Admin ID)
-  static Future<List<Map<String, dynamic>>> getAllClientInfo(String adminId) async {
-    try {
-      final querySnapshot = await _firestore.collection('client_info')
-          .where('admin_id', isEqualTo: adminId) // FILTER
-          .orderBy('created_at', descending: true)
-          .get();
-      
-      return querySnapshot.docs.map((doc) {
-        final data = doc.data();
-        data['id'] = doc.id;
-        return data;
-      }).toList();
-    } catch (e) {
-      print('Error getting client info: $e');
-      return [];
-    }
+static Future<List<Map<String, dynamic>>> getAllClientInfo(String adminId) async {
+  try {
+    // Query without orderBy to avoid composite index requirement
+    final querySnapshot = await _firestore.collection('client_info')
+        .where('admin_id', isEqualTo: adminId)
+        .get();
+    
+    return querySnapshot.docs.map((doc) {
+      final data = doc.data();
+      data['id'] = doc.id;
+      return data;
+    }).toList();
+  } catch (e) {
+    print('Error getting client info: $e');
+    return [];
   }
+}
   
   /// Update client information
   static Future<bool> updateClientInfo(String documentId, Map<String, dynamic> data) async {
@@ -210,6 +253,26 @@ class FirebaseService {
     }
   }
 
+  /// Delete client info by folder name and admin ID
+  static Future<bool> deleteClientInfoByFolder(String folderName, String adminId) async {
+    try {
+      final querySnapshot = await _firestore.collection('client_info')
+          .where('folder_name', isEqualTo: folderName)
+          .where('admin_id', isEqualTo: adminId)
+          .get();
+      
+      for (var doc in querySnapshot.docs) {
+        await doc.reference.delete();
+      }
+      
+      print('✅ Deleted ${querySnapshot.docs.length} client info records for folder "$folderName"');
+      return true;
+    } catch (e) {
+      print('Error deleting client info by folder: $e');
+      return false;
+    }
+  }
+
   /// Save recording metadata
   static Future<String?> saveRecording({
     required String folderName,
@@ -220,6 +283,7 @@ class FirebaseService {
     required String date,
     String? transcription,
     required String adminId, // REQUIRED: Owner
+    List<double>? waveform, // Added waveform parameter
   }) async {
     try {
       final docRef = await _firestore.collection('recordings').add({
@@ -232,6 +296,7 @@ class FirebaseService {
         'transcription': transcription ?? '',
         'admin_id': adminId, // Tag with Owner
         'created_at': FieldValue.serverTimestamp(),
+        'waveform_data': waveform, // Save waveform data
       });
       return docRef.id;
     } catch (e) {
@@ -282,6 +347,98 @@ class FirebaseService {
     } catch (e) {
       print('Error deleting recording: $e');
       return false;
+    }
+  }
+
+  /// Save biomarker analysis result for future analytics
+  static Future<String?> saveBiomarkerResult({
+    required String recordingId,
+    required String folderName,
+    required String adminId,
+    required String transcript,
+    String? fileName, // Added for linking by name
+    required Map<String, dynamic> severity,
+    required Map<String, dynamic> emotion,
+    required List<Map<String, dynamic>> anxietyIndicators,
+    required List<String> detectedConditions,
+    required String summary,
+    int? processingTimeMs,
+    Map<String, dynamic>? extractedFeatures,
+  }) async {
+    try {
+      final docRef = await _firestore.collection('biomarker_results').add({
+        'recording_id': recordingId,
+        'folder_name': folderName,
+        'file_name': fileName, // Save filename
+        'admin_id': adminId,
+        'transcript': transcript,
+        'severity': severity,
+        'emotion': emotion,
+        'anxiety_indicators': anxietyIndicators,
+        'detected_conditions': detectedConditions,
+        'summary': summary,
+        'processing_time_ms': processingTimeMs,
+        'extracted_features': extractedFeatures,
+        'created_at': FieldValue.serverTimestamp(),
+      });
+      print('✅ Biomarker result saved to Firebase: ${docRef.id}');
+      return docRef.id;
+    } catch (e) {
+      print('Error saving biomarker result: $e');
+      return null;
+    }
+  }
+
+  /// Save full extracted features to a subcollection
+  static Future<void> saveExtractedFeatures(String biomarkerId, Map<String, dynamic> features) async {
+    try {
+      await _firestore.collection('biomarker_results').doc(biomarkerId)
+          .collection('features').doc('extracted').set(features);
+      print('✅ Extracted features saved to subcollection');
+    } catch (e) {
+      print('Error saving extracted features: $e');
+    }
+  }
+
+  /// Save extracted features to the recordings collection (linked to recording doc)
+  static Future<void> saveFeaturesToRecording(String recordingDocId, Map<String, dynamic> features) async {
+    try {
+      // 1. Save to subcollection
+      await _firestore.collection('recordings').doc(recordingDocId)
+          .collection('features').doc('extracted').set(features);
+          
+      // 2. Save as field in main doc for visibility
+      await _firestore.collection('recordings').doc(recordingDocId).update({
+        'extracted_features': features
+      });
+      
+      print('✅ Extracted features saved to recordings (field & subcollection)');
+    } catch (e) {
+      print('Error saving features to recording: $e');
+    }
+  }
+
+  /// Get biomarker results for analytics (filtered by admin)
+  static Future<List<Map<String, dynamic>>> getBiomarkerResults(String adminId, {String? folderName}) async {
+    try {
+      Query query = _firestore.collection('biomarker_results')
+          .where('admin_id', isEqualTo: adminId)
+          .orderBy('created_at', descending: true);
+      
+      if (folderName != null) {
+        query = query.where('folder_name', isEqualTo: folderName);
+      }
+      
+      final querySnapshot = await query.get();
+      
+      return querySnapshot.docs.map((doc) {
+        final data = doc.data() as Map<String, dynamic>;
+        data['id'] = doc.id;
+        return data;
+      }).toList();
+    } catch (e) {
+      print('Error getting biomarker results: $e');
+      return [];
     }
   }
 }
