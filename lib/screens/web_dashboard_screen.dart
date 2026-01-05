@@ -1,16 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'dart:html' as html;
+import 'dart:math';
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../services/firebase_service.dart';
+import '../services/audio_recorder_service.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:record/record.dart';
+import '../widgets/waveform_visualizer.dart';
 
 class WebDashboardScreen extends StatefulWidget {
   const WebDashboardScreen({super.key});
@@ -27,6 +30,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
   List<Map<String, dynamic>> _clients = [];
   bool _isLoading = true;
   String? _currentAdminId; // Store current Admin ID
+  String _adminFullName = 'Admin'; // Store current admin's full name
 
   // Selected recording for analysis view
   Map<String, dynamic>? _selectedAnalysisRecording;
@@ -44,32 +48,89 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
   int _recordingDuration = 0; // in seconds
   Timer? _recordingTimer;
   
-  // Audio Recorder
-  late final AudioRecorder _audioRecorder = AudioRecorder();
-  StreamSubscription<Amplitude>? _amplitudeSub;
+  // Audio Recorder Service
+  final AudioRecorderService _audioService = AudioRecorderService();
+
+  StreamSubscription<double>? _amplitudeSub;
   List<double> _amplitudeLevels = []; // For visualization
+  double _currentAmplitude = 0.0; // For WaveformVisualizer
   
   // Selected folder/client for recording
   String? _selectedFolderName;
   bool _hasShownClientDialog = false; // Prevents repeated dialog on rebuild
 
+  // Web Speech Recognition
+  html.SpeechRecognition? _speechRecognition;
+  String _currentTranscript = "";
+  bool _isSpeechAvailable = false;
+  
+  // Real-time Audio Visualization
+  List<double> _audioWaveform = List.filled(50, 0.0);
+
   @override
   void initState() {
     super.initState();
+    _initSpeech();
     _initializeApp();
+  }
+
+  void _initSpeech() {
+    if (html.SpeechRecognition.supported) {
+      _speechRecognition = html.SpeechRecognition();
+      _speechRecognition!.continuous = true;
+      _speechRecognition!.interimResults = true;
+      _speechRecognition!.lang = 'en-US'; // Default to English (US)
+      
+      _speechRecognition!.onResult.listen((event) {
+        if (event.results == null) return;
+        
+        String finalTranscript = "";
+        String interimTranscript = "";
+        
+        // Critical Fix: Iterate from 0 to capture full session transcript
+        // Previous logic (event.resultIndex) dropped early sentences
+        for (var i = 0; i < event.results!.length; ++i) {
+          if (event.results![i].isFinal!) {
+            finalTranscript += event.results![i].item(0)!.transcript!;
+          } else {
+            interimTranscript += event.results![i].item(0)!.transcript!;
+          }
+        }
+        
+        if (mounted) {
+          setState(() {
+            _currentTranscript = finalTranscript + interimTranscript;
+          });
+        }
+      });
+      
+      _speechRecognition!.onError.listen((event) {
+        print("Speech Recognition Error: ${event.error}");
+      });
+      
+      setState(() {
+        _isSpeechAvailable = true;
+      });
+    } else {
+      print("Web Speech API not supported in this browser.");
+    }
   }
 
   @override
   void dispose() {
     _recordingTimer?.cancel();
     _amplitudeSub?.cancel();
-    _audioRecorder.dispose();
+    _audioService.dispose();
     super.dispose();
   }
 
   Future<void> _initializeApp() async {
-    // 1. Fetch Admin ID first
+    // 1. Fetch Admin ID and Info first
     _currentAdminId = await FirebaseService.getCurrentAdminId();
+    final adminInfo = await FirebaseService.getCurrentAdminInfo();
+    if (adminInfo != null) {
+      _adminFullName = adminInfo['full_name'] ?? 'Admin';
+    }
     if (mounted) {
       if (_currentAdminId == null) {
         // Should likely logout if cant find admin ID, but let's handle gracefully
@@ -130,7 +191,12 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       
       // Sort each folder's recordings by date (locally, to avoid index requirement)
       loadedFolders.forEach((folder, recordings) {
-        recordings.sort((a, b) => (b['date'] ?? '').compareTo(a['date'] ?? ''));
+        recordings.sort((a, b) {
+           final aDate = a['date'];
+           final bDate = b['date'];
+           // Handle mixed types (Timestamp vs String) safely by converting to String
+           return (bDate?.toString() ?? '').compareTo(aDate?.toString() ?? '');
+        });
       });
 
       if (mounted) {
@@ -168,11 +234,19 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       }).toList();
       
       // Sort by created_at locally (in case Firestore index not set)
+      // Sort by created_at locally (in case Firestore index not set)
       clients.sort((a, b) {
-        final aTime = a['created_at'];
-        final bTime = b['created_at'];
-        if (aTime == null || bTime == null) return 0;
-        return (bTime as Timestamp).compareTo(aTime as Timestamp);
+        final aRaw = a['created_at'];
+        final bRaw = b['created_at'];
+        if (aRaw == null && bRaw == null) return 0;
+        if (aRaw == null) return 1;
+        if (bRaw == null) return -1;
+        
+        if (aRaw is Timestamp && bRaw is Timestamp) {
+          return bRaw.compareTo(aRaw);
+        }
+        // Fallback for String or mismatch
+        return bRaw.toString().compareTo(aRaw.toString());
       });
 
       if (mounted) {
@@ -286,9 +360,8 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     switch (_selectedIndex) {
       case 0: return 'Dashboard Overview';
       case 1: return 'Analytics';
-      case 2: return 'Record Audio';
-      case 3: return 'Recordings';
-      case 4: return 'Settings';
+      case 2: return 'Recordings';
+      case 3: return 'Settings';
       default: return 'Dashboard';
     }
   }
@@ -1063,11 +1136,11 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
             ),
             const SizedBox(width: 12),
-            Text('Analyzing ${file.name} with AI Model...'),
+            Expanded(child: Text('Analyzing ${file.name}... (transcription, features, ML prediction)')),
           ],
         ),
         backgroundColor: const Color(0xFF2E7D32),
-        duration: const Duration(seconds: 60), // Longer duration for analysis
+        duration: const Duration(seconds: 120), // Longer duration for full analysis
       ),
     );
     
@@ -1079,56 +1152,114 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       
       final audioBytes = reader.result as Uint8List;
 
-      // 2. Send to Python Backend (app.py)
-      // Note: Ensure app.py is running on port 5000
-      var request = http.MultipartRequest('POST', Uri.parse('http://127.0.0.1:5000/upload-audio'));
+      // 2. Send to mobile_api.py Backend (port 5001) for full processing
+      // The /analyze endpoint handles: transcription, translation, feature extraction, ML prediction
+      var request = http.MultipartRequest('POST', Uri.parse('http://127.0.0.1:5001/analyze'));
       request.files.add(http.MultipartFile.fromBytes(
         'audio', 
         audioBytes,
         filename: file.name
       ));
-      request.fields['folder'] = folderName;
-      request.fields['transcript'] = ''; // Let backend handle transcription
+      request.fields['folder_name'] = folderName;
+      request.fields['admin_id'] = _currentAdminId ?? '';
+      request.fields['transcript'] = ''; // Let backend handle transcription via Whisper
 
-      print('Sending to Python Backend...');
+      print('📤 Sending to mobile_api.py (port 5001) for full analysis...');
       var streamedResponse = await request.send();
       var response = await http.Response.fromStream(streamedResponse);
       
-      print('Response status: ${response.statusCode}');
+      print('📥 Response status: ${response.statusCode}');
       
       Map<String, dynamic> analysisResult = {};
       if (response.statusCode == 200) {
         analysisResult = jsonDecode(response.body);
-        print('Analysis success: $analysisResult');
+        print('✅ Analysis success: severity=${analysisResult['severity_level']}, indicators=${(analysisResult['indicators'] as List?)?.length ?? 0}');
       } else {
-        print('Backend error: ${response.body}');
+        print('❌ Backend error: ${response.body}');
         throw Exception("AI Analysis Failed: ${response.body}");
       }
       
-      // 3. Save recording metadata + Analysis to Firestore
+      // 3. Extract all data from the response
       final now = DateTime.now();
-      final severity = analysisResult['severity'] ?? {'level': 'Unknown', 'score': 0};
-      final emotion = analysisResult['emotion'] ?? {'label': 'Unknown', 'confidence': 0};
       
+      // Transcription data
+      final transcript = analysisResult['transcript'] ?? '';
+      final transcriptEn = analysisResult['transcript_en'] ?? '';
+      final transcriptTl = analysisResult['transcript_tl'] ?? '';
+      
+      // Severity data
+      final severityLevel = analysisResult['severity_level'] ?? 'Normal';
+      final severityConfidence = analysisResult['severity_confidence'] ?? 0;
+      final severityProbabilities = analysisResult['severity_probabilities'] ?? {};
+      
+      // Emotion data
+      final emotion = analysisResult['emotion'] ?? 'Neutral';
+      final emotionConfidence = analysisResult['emotion_confidence'] ?? 0;
+      
+      // Indicators (anxiety + educational)
+      final indicators = analysisResult['indicators'] ?? [];
+      
+      // Extracted features for visualization and storage
+      final extractedFeatures = analysisResult['extracted_features'] ?? {};
+      final waveform = extractedFeatures['waveform'] ?? [];
+      
+      // Overall confidence
+      final overallConfidence = analysisResult['overall_confidence'] ?? 0;
+      
+      // 4. Save complete recording metadata + Analysis to Firestore
       await FirebaseFirestore.instance.collection('recordings').add({
+        // Basic info
         'folder_name': folderName,
         'name': file.name,
         'size': '${(file.size / 1024).toStringAsFixed(1)} KB',
         'date': '${_getMonthName(now.month)} ${now.day}, ${now.year}',
-        'duration': analysisResult['duration'] ?? '00:00:00', 
-        'transcription': analysisResult['transcript'] ?? '',
+        'duration': analysisResult['processing_time_ms'] != null 
+            ? '${(analysisResult['processing_time_ms'] / 1000).toStringAsFixed(1)}s processing'
+            : '00:00:00',
         
-        // Analysis Data
-        'severity_level': severity['level'],
-        'severity_score': severity['score'],
-        'emotion_label': emotion['label'],
-        'emotion_confidence': emotion['confidence'],
-        'anxiety_indicators': analysisResult['anxiety_indicators'] ?? [],
+        // Transcription (original + translations)
+        'transcription': transcript,
+        'transcript_en': transcriptEn,
+        'transcript_tl': transcriptTl,
+        
+        // Severity Analysis
+        'severity_level': severityLevel,
+        'severity_confidence': severityConfidence,
+        'severity_probabilities': severityProbabilities,
+        
+        // Emotion Analysis
+        'emotion_label': emotion,
+        'emotion_confidence': emotionConfidence,
+        
+        // ML Indicators (complete list with probabilities and reasons)
+        'indicators': indicators,
+        'anxiety_indicators': indicators, // For backward compatibility
+        
+        // Word Analysis (for highlighting in UI)
+        'negative_matches': extractedFeatures['negative_matches'] ?? [],
+        'positive_matches': extractedFeatures['positive_matches'] ?? [],
+        'cognitive_matches': extractedFeatures['cognitive_matches'] ?? [],
+        'absolutist_matches': extractedFeatures['absolutist_matches'] ?? [],
+        'distress_words': extractedFeatures['distress_words'] ?? [],
+        'analyzed_words': extractedFeatures['analyzed_words'] ?? [],
+        
+        // Audio Features
+        'waveform': waveform,
+        'jitter': extractedFeatures['jitter'] ?? 0,
+        'shimmer': extractedFeatures['shimmer'] ?? 0,
+        'hnr': extractedFeatures['hnr'] ?? 0,
+        'pitch_mean': extractedFeatures['pitch_mean'] ?? 0,
+        'energy_mean': extractedFeatures['energy_mean'] ?? 0,
+        
+        // Confidence and summary
+        'overall_confidence': overallConfidence,
         'summary': analysisResult['summary'] ?? '',
         
+        // Metadata
         'uploaded_at': FieldValue.serverTimestamp(),
-        'source': 'web_upload_analyzed',
+        'source': 'web_dashboard_analyzed',
         'admin_id': _currentAdminId,
+        'processing_time_ms': analysisResult['processing_time_ms'] ?? 0,
       });
       
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -1138,24 +1269,47 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
             children: [
               const Icon(Icons.check_circle, color: Colors.white),
               const SizedBox(width: 12),
-              Text('Analysis Complete! Saved to $folderName'),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('Analysis Complete! Saved to $folderName'),
+                    Text(
+                      'Severity: $severityLevel (${severityConfidence}%) • ${(indicators as List).length} indicators detected',
+                      style: const TextStyle(fontSize: 12, color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
           backgroundColor: const Color(0xFF2E7D32),
+          duration: const Duration(seconds: 5),
         ),
       );
     } catch (e) {
-      print('Upload Error: $e');
+      print('❌ Upload Error: $e');
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Error: $e. Is Python Server running?'),
+          content: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Analysis Failed', style: TextStyle(fontWeight: FontWeight.bold)),
+              Text('$e', style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 4),
+              const Text('Make sure mobile_api.py is running on port 5001', style: TextStyle(fontSize: 11, color: Colors.white70)),
+            ],
+          ),
           backgroundColor: Colors.red,
-          duration: const Duration(seconds: 5),
+          duration: const Duration(seconds: 8),
         ),
       );
     }
   }
+
 
   String _getMonthName(int month) {
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -1441,51 +1595,83 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     // Count recordings per day
     _allFolders.forEach((folder, recordings) {
       for (var recording in recordings) {
-        final dateStr = recording['date'] ?? '';
-        // Extract day from "Dec 13, 2024" format
+        DateTime? date;
+        final rawDate = recording['date'];
+        
+        // Parse date safely
         try {
-          final parts = dateStr.split(', ');
-          if (parts.length >= 2) {
-            final dayPart = parts[0].split(' ');
-            if (dayPart.length >= 2) {
-              final dayNum = int.tryParse(dayPart[1]) ?? 0;
-              // Match to our day list (simplified - just count for demo)
-              for (var key in dailyCounts.keys) {
-                dailyCounts[key] = (dailyCounts[key] ?? 0) + (dayNum % 7 == dailyCounts.keys.toList().indexOf(key) ? 1 : 0);
-              }
+          if (rawDate is Timestamp) {
+            date = rawDate.toDate();
+          } else if (rawDate is String) {
+            // Try ISO format first
+            date = DateTime.tryParse(rawDate);
+            // If failed, try parse "Dec 13, 2024" format manually if needed, 
+            // but usually we save ISO or standard.
+            // For the specific format "Month DD, YYYY lines":
+            if (date == null && rawDate.contains(',')) {
+               // Quick hack/effort for "Dec 13, 2024" style if standard parsing fails
+               // Better to rely on the 'created_at' ISO field if available
+            }
+          }
+          
+          // Fallback to 'created_at' if 'date' failed
+          if (date == null && recording['created_at'] != null) {
+             if (recording['created_at'] is String) {
+               date = DateTime.tryParse(recording['created_at']);
+             } else if (recording['created_at'] is Timestamp) {
+               date = (recording['created_at'] as Timestamp).toDate();
+             }
+          }
+
+          if (date != null) {
+            final dayName = dayNames[date.weekday - 1]; // 1=Mon .. 7=Sun
+            // Only count if it's within the last 7 days displayed
+            if (dailyCounts.containsKey(dayName)) {
+               // Check if it's actually the correct recent date, not just "a Monday"
+               // For simplicity in this chart, we align by weekday name for the last week
+               dailyCounts[dayName] = (dailyCounts[dayName] ?? 0) + 1;
             }
           }
         } catch (e) {
-          // Skip invalid dates
+          print('Error parsing date for activity chart: $e');
         }
       }
     });
     
-    // If no real data, use sample data
-    if (dailyCounts.values.every((v) => v == 0)) {
-      dailyCounts = {'Mon': 3, 'Tue': 5, 'Wed': 2, 'Thu': 8, 'Fri': 4, 'Sat': 1, 'Sun': 6};
-    }
+    // Check if we have any data
+    final hasData = dailyCounts.values.any((v) => v > 0);
     
     return Column(
       children: [
         Expanded(
-          child: CustomPaint(
-            painter: LineGraphPainter(
-              data: dailyCounts.values.toList(),
-              labels: dailyCounts.keys.toList(),
-            ),
-            child: const SizedBox.expand(),
-          ),
+          child: hasData 
+            ? CustomPaint(
+                painter: LineGraphPainter(
+                  data: dailyCounts.values.toList(),
+                  labels: dailyCounts.keys.toList(),
+                ),
+                child: const SizedBox.expand(),
+              )
+            : Center(
+                child: Text(
+                  'No recording activity in the last 7 days',
+                  style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                ),
+              ),
         ),
         const SizedBox(height: 8),
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: dailyCounts.keys.map((day) => 
-            Text(day, style: TextStyle(fontSize: 11, color: Colors.grey[600]))
+            Text(day, style: TextStyle(
+              fontSize: 11, 
+              color: hasData ? Colors.grey[600] : Colors.grey[300]
+            ))
           ).toList(),
         ),
       ],
     );
+
   }
 
   Widget _buildAnalysisSummary() {
@@ -1705,8 +1891,12 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       }
     });
     
-    // Sort by date (most recent first) - simplified sort
-    allRecordings.sort((a, b) => (b['date'] ?? '').compareTo(a['date'] ?? ''));
+    // Sort by date (most recent first) - simplified sort with mixed type handling
+    allRecordings.sort((a, b) {
+       final aDate = a['date'];
+       final bDate = b['date'];
+       return (bDate?.toString() ?? '').compareTo(aDate?.toString() ?? '');
+    });
     
     // Take only first 10
     final recentRecordings = allRecordings.take(10).toList();
@@ -1848,7 +2038,22 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     // Process waveform for display
     List<double> waveformPoints = [];
     if (rawWaveform.isNotEmpty) {
-      waveformPoints = rawWaveform.map((e) => (e as num).toDouble()).toList();
+      // Skip leading zeros - find first non-zero value
+      int startIndex = 0;
+      for (int i = 0; i < rawWaveform.length; i++) {
+        if ((rawWaveform[i] as num).toDouble() > 0.1) {
+          startIndex = i;
+          break;
+        }
+      }
+      // Use only the active portion
+      List<dynamic> activeWave = rawWaveform.sublist(startIndex);
+      
+      // Normalize: if values are 0-100, scale to 0-1
+      waveformPoints = activeWave.map((e) {
+        double rawVal = (e as num).toDouble();
+        return rawVal > 1.0 ? (rawVal / 100.0).clamp(0.0, 1.0) : rawVal.clamp(0.0, 1.0);
+      }).toList();
     } else {
       // Fallback simulation only if no data
       waveformPoints = List.generate(50, (i) {
@@ -1916,13 +2121,15 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     crossAxisAlignment: CrossAxisAlignment.center,
-                    children: waveformPoints.take(50).map((height) {
+                    children: waveformPoints.take(80).map((height) {
+                      double barHeight = height * 70;
+                      if (barHeight < 4) barHeight = 4; // Minimum height
                       return Container(
-                        width: 4,
-                        height: height * 80, 
+                        width: 3,
+                        height: barHeight, 
                         decoration: BoxDecoration(
-                          color: const Color(0xFF2E7D32).withOpacity(0.4 + (height * 0.6).clamp(0.0, 0.6)),
-                          borderRadius: BorderRadius.circular(2),
+                          color: Color(0xFF2E7D32).withOpacity((0.5 + (height * 0.5)).clamp(0.0, 1.0)),
+                          borderRadius: BorderRadius.circular(1.5),
                         ),
                       );
                     }).toList(),
@@ -1951,40 +2158,152 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     Map<String, int> severityData = {'Normal': 0, 'Moderate': 0, 'Severe': 0};
     
     if (_selectedWaveformRecording != null) {
-      // Show ALL probabilities for the selected recording
+      // Show severity distribution for the selected recording based on EMOTION data
       final result = _findMatchingBiomarkerResult();
+      print('DEBUG: Selected recording: ${_selectedWaveformRecording?['name']}');
+      print('DEBUG: Matching result found: ${result != null}');
+      
       if (result != null && result.isNotEmpty) {
-        final severity = result['severity'] as Map<String, dynamic>? ?? {};
-        // Get probabilities from the result
-        final probabilities = severity['probabilities'] as Map<String, dynamic>? ?? {};
-        if (probabilities.isNotEmpty) {
-          severityData['Normal'] = (probabilities['Normal'] as num?)?.toInt() ?? 0;
-          severityData['Moderate'] = (probabilities['Moderate'] as num?)?.toInt() ?? 0;
-          severityData['Severe'] = (probabilities['Severe'] as num?)?.toInt() ?? 0;
+        // PRIORITY: Use emotion.label + emotion.confidence to calculate distribution
+        // PRIORITY: Use valid severity data directly from backend
+        final severityDataRaw = result['severity'] as Map<String, dynamic>? ?? {};
+        final rawProbs = severityDataRaw['probabilities'] as Map<String, dynamic>?;
+        
+        if (rawProbs != null && rawProbs.isNotEmpty) {
+           // Use the exact probabilities from the backend
+           severityData['Normal'] = (rawProbs['Normal'] as num?)?.toInt() ?? 0;
+           severityData['Moderate'] = (rawProbs['Moderate'] as num?)?.toInt() ?? 0;
+           severityData['Severe'] = (rawProbs['Severe'] as num?)?.toInt() ?? 0;
+           print('DEBUG: Used backend probabilities: $severityData');
         } else {
-          // Fallback to level-based display if no probabilities
-          final level = severity['level']?.toString() ?? 'Normal';
-          final conf = (severity['confidence'] as num?)?.toInt() ?? 100;
-          severityData[level] = conf;
+           // Legacy Fallback: Synthesize distribution if backend probs missing
+           String effectiveSeverity = severityDataRaw['level']?.toString() ?? 'Unknown';
+           int confidence = (severityDataRaw['confidence'] as num?)?.toInt() ?? 0;
+           
+           // Fallback: If severity is missing/unknown, infer from emotion (Legacy behavior)
+           if (effectiveSeverity == 'Unknown' || effectiveSeverity == 'null') {
+             // ... [Rest of legacy logic identical to before] ...
+             final emotionData = result['emotion'] as Map<String, dynamic>? ?? {};
+             final emotionLabel = emotionData['label']?.toString() ?? 'Neutral';
+             final emotionConf = (emotionData['confidence'] as num?)?.toInt() ?? 50;
+             confidence = emotionConf;
+             
+             if (emotionLabel == 'Neutral' || emotionLabel == 'Happy' || emotionLabel == 'Calm') {
+                effectiveSeverity = 'Normal';
+             } else if (emotionLabel == 'Sad' || emotionLabel == 'Fear' || emotionLabel == 'Fearful') {
+                effectiveSeverity = 'Moderate';
+             } else if (emotionLabel == 'Angry' || emotionLabel == 'Disgust') {
+                effectiveSeverity = 'Severe';
+             } else {
+                effectiveSeverity = 'Normal';
+             }
+           }
+           
+           // Normalize string case
+           if (effectiveSeverity.toLowerCase() == 'normal') effectiveSeverity = 'Normal';
+           else if (effectiveSeverity.toLowerCase() == 'moderate') effectiveSeverity = 'Moderate';
+           else if (effectiveSeverity.toLowerCase() == 'severe') effectiveSeverity = 'Severe';
+           
+           // Set the main severity with its confidence
+           severityData[effectiveSeverity] = confidence;
+           
+           // Distribute the remainder to other categories
+           final remainder = 100 - confidence;
+           if (effectiveSeverity == 'Normal') {
+             severityData['Moderate'] = remainder ~/ 2;
+             severityData['Severe'] = remainder - (remainder ~/ 2);
+           } else if (effectiveSeverity == 'Moderate') {
+             severityData['Normal'] = remainder ~/ 2;
+             severityData['Severe'] = remainder - (remainder ~/ 2);
+           } else {
+             severityData['Normal'] = remainder ~/ 2;
+             severityData['Moderate'] = remainder - (remainder ~/ 2);
+           }
         }
       } else {
         severityData['Normal'] = 100; // Default if no data
       }
     } else if (_biomarkerResults.isNotEmpty) {
-      // Aggregate only WINNER (highest probability level) from each recording
+      // NO SELECTION: Count the WINNER severity from each recording
+      // Then show the distribution as percentage of recordings
+      Map<String, int> winnerCounts = {'Normal': 0, 'Moderate': 0, 'Severe': 0};
+      
       for (var result in _biomarkerResults) {
-        final severity = result['severity'] as Map<String, dynamic>? ?? {};
-        final level = severity['level']?.toString() ?? 'Normal'; // Winner level
-        severityData[level] = (severityData[level] ?? 0) + 1;
+        String winnerLevel = 'Normal';
+        
+        // PRIORITY: Use severity level directly
+        final severityDataRaw = result['severity'] as Map<String, dynamic>? ?? {};
+        String rawLevel = severityDataRaw['level']?.toString() ?? 'Unknown';
+        
+        if (rawLevel != 'Unknown' && rawLevel != 'null') {
+           winnerLevel = rawLevel;
+        } else {
+           // Fallback to emotion
+           final emotionData = result['emotion'] as Map<String, dynamic>? ?? {};
+           final emotionLabel = emotionData['label']?.toString() ?? 'Neutral';
+           
+           if (emotionLabel == 'Neutral' || emotionLabel == 'Happy' || emotionLabel == 'Calm') {
+             winnerLevel = 'Normal';
+           } else if (emotionLabel == 'Sad' || emotionLabel == 'Fear' || emotionLabel == 'Fearful') {
+             winnerLevel = 'Moderate';
+           } else if (emotionLabel == 'Angry' || emotionLabel == 'Disgust') {
+             winnerLevel = 'Severe';
+           }
+        }
+        
+        // Normalize
+        if (winnerLevel.toLowerCase() == 'normal') winnerLevel = 'Normal';
+        else if (winnerLevel.toLowerCase() == 'moderate') winnerLevel = 'Moderate';
+        else if (winnerLevel.toLowerCase() == 'severe') winnerLevel = 'Severe';
+        else winnerLevel = 'Normal'; // Fallback
+        
+        winnerCounts[winnerLevel] = (winnerCounts[winnerLevel] ?? 0) + 1;
       }
+      
+      // Convert counts to percentages
+      final total = _biomarkerResults.length;
+      severityData['Normal'] = ((winnerCounts['Normal'] ?? 0) / total * 100).round();
+      severityData['Moderate'] = ((winnerCounts['Moderate'] ?? 0) / total * 100).round();
+      severityData['Severe'] = ((winnerCounts['Severe'] ?? 0) / total * 100).round();
+      
+      print('DEBUG: Winner counts based on severity: $winnerCounts');
     } else {
       // No data - show placeholder
       severityData = {'Normal': 1, 'Moderate': 0, 'Severe': 0};
     }
     
+    print('DEBUG: Final severityData: $severityData');
+    
     final total = severityData.values.fold(0, (a, b) => a + b);
     if (total == 0) {
-      severityData['Normal'] = 1;
+      // No Data State
+      return Column(
+        children: [
+          Container(
+            height: 24,
+            decoration: BoxDecoration(
+              color: Colors.grey[200],
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Center(
+              child: Text(
+                'No Data',
+                style: TextStyle(fontSize: 10, color: Colors.grey),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          // Legend (Placeholder)
+           Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+               Icon(Icons.info_outline, size: 12, color: Colors.grey[400]),
+               const SizedBox(width: 4),
+               Text('No severity analysis available', style: TextStyle(color: Colors.grey[400], fontSize: 11)),
+            ],
+          ),
+        ],
+      );
     }
     
     final colors = {
@@ -2094,7 +2413,21 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         .toList();
     
     if (anxietyData.isEmpty) {
-      anxietyData.add(ChartSegment('Normal', 1));
+        // No Data layout
+        return Column(
+          children: [
+            Expanded(
+              child: CustomPaint(
+                painter: SemiCircleChartPainter(
+                  data: [ChartSegment('No Data', 1)], 
+                  colors: [Colors.grey[200]!]
+                ),
+                child: const SizedBox.expand(),
+              ),
+            ),
+             Text('No Data', style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+          ],
+        );
     }
     
     final colorMap = {
@@ -2119,7 +2452,10 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     const educationalIssues = {
       'Impostor Syndrome', 'Academic Burnout', 'Perfectionism', 
       'Fear Of Failure', 'Fear of Failure', 'Test Anxiety',
-      'Low Self-Esteem', 'Lack of Support', 'Pressure',
+      'Low Self-Esteem', 'Low Self Esteem', // Handle both formats
+      'Lack of Support', 'Lack Of Academic Support', 
+      'Pressure', 'Pressure Of Surroundings',
+      'Poor Time Management',
     };
     
     // Use real data from biomarker results - anxiety_indicators
@@ -2161,9 +2497,21 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       }
     }
     
-    // If no issues detected, show a "No Issues" placeholder
+    // If no issues detected, show "No Data" placeholder instead of generic "No Issues"
     if (issuesData.isEmpty) {
-      issuesData['No Issues Detected'] = 100;
+       return Center(
+         child: Column(
+           mainAxisAlignment: MainAxisAlignment.center,
+           children: [
+             Icon(Icons.analytics_outlined, size: 32, color: Colors.grey[300]),
+             const SizedBox(height: 8),
+             Text(
+               'No educational issues data available',
+               style: TextStyle(color: Colors.grey[400], fontSize: 12),
+             ),
+           ],
+         ),
+       );
     }
     
     // Sort by value descending
@@ -2534,11 +2882,12 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       return _buildPredictionAnalysisPage();
     }
     
+    // Nav order: 0=Overview, 1=Analytics, 2=Recordings, 3=Settings
     switch (_selectedIndex) {
       case 0: return _buildOverviewPage();
       case 1: return _buildAnalyticsPage();
-      case 2: return _buildRecordPage();
-      case 3: return _buildRecordingsPage();
+      case 2: return _buildRecordingsPage();
+      case 3: return _buildOverviewPage(); // Settings - show overview for now
       default: return _buildOverviewPage();
     }
   }
@@ -2733,7 +3082,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                         style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
                       ),
                       const SizedBox(height: 8),
-                      Text('Biomarker Results (Demo)', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                      Text('Biomarker Results', style: TextStyle(color: Colors.white70, fontSize: 12)),
                       const SizedBox(height: 16),
                       Expanded(child: _buildAnalysisSummary()),
                     ],
@@ -2773,7 +3122,6 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                             'Anxiety Types Distribution',
                             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF263238)),
                           ),
-                          Text('(Demo)', style: TextStyle(color: Colors.grey[400], fontSize: 11)),
                         ],
                       ),
                       const SizedBox(height: 12),
@@ -2809,7 +3157,6 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                             'Emotion Distribution',
                             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF263238)),
                           ),
-                          Text('(Demo)', style: TextStyle(color: Colors.grey[400], fontSize: 11)),
                         ],
                       ),
                       const SizedBox(height: 12),
@@ -2852,7 +3199,10 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                             'Severity Distribution',
                             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF263238)),
                           ),
-                          Text('(Demo)', style: TextStyle(color: Colors.grey[400], fontSize: 11)),
+                          Text(_selectedWaveformRecording != null 
+                            ? '(Selected)' 
+                            : (_biomarkerResults.isEmpty ? '(No Data)' : '(${_biomarkerResults.length} results avg)'), 
+                            style: TextStyle(color: _selectedWaveformRecording != null ? Colors.green : Colors.grey[400], fontSize: 11)),
                         ],
                       ),
                       const SizedBox(height: 20),
@@ -2888,7 +3238,6 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                             'Educational Issues',
                             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Color(0xFF263238)),
                           ),
-                          Text('Top 5 (Demo)', style: TextStyle(color: Colors.grey[400], fontSize: 11)),
                         ],
                       ),
                       const SizedBox(height: 16),
@@ -3579,7 +3928,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                       children: [
                         // Waveform Visualization Box
                         Container(
-                          height: 100,
+                          height: 140,
                           padding: const EdgeInsets.all(16),
                           decoration: BoxDecoration(
                             gradient: LinearGradient(
@@ -3604,63 +3953,24 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                             ],
                           ),
                           child: _isRecording || _recordingDuration > 0
-                              ? Center(
-                                  child: Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    crossAxisAlignment: CrossAxisAlignment.center,
-                                    children: List.generate(45, (index) {
-                                      final baseHeight = 25.0 + (index % 5) * 12.0;
-                                      
-                                      double amplitudeFactor = 0.0;
-                                      // Logic to map index 0..44 to the latest amplitudes (Rightmost is latest)
-                                      if (_isRecording && !_isPaused && _amplitudeLevels.isNotEmpty) {
-                                         int dataIndex = index - (45 - _amplitudeLevels.length);
-                                         if (dataIndex >= 0 && dataIndex < _amplitudeLevels.length) {
-                                           amplitudeFactor = _amplitudeLevels[dataIndex];
-                                         }
-                                      }
-
-                                      double animatedHeight;
-                                      if (_isRecording && !_isPaused) {
-                                         if (amplitudeFactor > 0.01) {
-                                            // Animate based on real amplitude (15 to 80)
-                                            animatedHeight = 15.0 + (amplitudeFactor * 65.0);
-                                         } else {
-                                            // Idle noise
-                                            animatedHeight = baseHeight * 0.3 + 4; 
-                                         }
-                                      } else {
-                                          // Static/Stopped
-                                          animatedHeight = baseHeight * 0.4;
-                                      }
-                                      
-                                      return AnimatedContainer(
-                                        duration: const Duration(milliseconds: 100),
-                                        margin: const EdgeInsets.symmetric(horizontal: 2),
-                                        width: 4,
-                                        height: animatedHeight.clamp(8.0, 80.0),
-                                        decoration: BoxDecoration(
-                                          gradient: LinearGradient(
-                                            begin: Alignment.topCenter,
-                                            end: Alignment.bottomCenter,
-                                            colors: _isRecording && !_isPaused
-                                                ? [
-                                                    const Color(0xFF2E7D32),
-                                                    const Color(0xFF66BB6A),
-                                                  ]
-                                                : [
-                                                    const Color(0xFF2E7D32).withOpacity(0.4),
-                                                    const Color(0xFF66BB6A).withOpacity(0.4),
-                                                  ],
-                                          ),
-                                          borderRadius: BorderRadius.circular(3),
-                                        ),
-                                      );
-                                    }),
+                              ? SizedBox(
+                                  height: 80,
+                                  width: double.infinity,
+                                  child: WaveformVisualizer(
+                                    level: _currentAmplitude,
+                                    isRecording: _isRecording && !_isPaused,
                                   ),
                                 )
-                              : const Center(
-                                  child: SizedBox.shrink(),
+                              : Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.graphic_eq, size: 48, color: Colors.grey[300]),
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      'Waveform Visualization',
+                                      style: TextStyle(color: Colors.grey[400], fontSize: 12),
+                                    ),
+                                  ],
                                 ),
                         ),
                         const SizedBox(height: 12),
@@ -3693,58 +4003,110 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                         ),
                         const SizedBox(height: 16),
                         
-                        // Microphone Recording Button
-                        InkWell(
-                          onTap: () {
-                            if (!_isRecording && _recordingDuration == 0) {
-                              _startRecording();
-                            } else if (_isRecording && !_isPaused) {
-                              _pauseRecording();
-                            } else if (_isPaused) {
-                              _resumeRecording();
-                            } else if (_recordingDuration > 0) {
-                              _stopRecording();
-                            }
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: _isRecording && !_isPaused
-                                  ? Colors.red.withOpacity(0.1)
-                                  : const Color(0xFF2E7D32).withOpacity(0.1),
-                              shape: BoxShape.circle,
-                              border: Border.all(
-                                color: _isRecording && !_isPaused
-                                    ? Colors.red
-                                    : const Color(0xFF2E7D32),
-                                width: 3,
-                              ),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: (_isRecording && !_isPaused
-                                          ? Colors.red
-                                          : const Color(0xFF2E7D32))
-                                      .withOpacity(0.3),
-                                  blurRadius: 10,
-                                  spreadRadius: 1,
+                        // Microphone Recording Controls
+                        if (_isRecording || _recordingDuration > 0)
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              // Pause/Resume Button
+                              InkWell(
+                                onTap: _isPaused ? _resumeRecording : _pauseRecording,
+                                borderRadius: BorderRadius.circular(50),
+                                child: Container(
+                                  padding: const EdgeInsets.all(16),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withOpacity(0.1),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(color: Colors.orange, width: 2),
+                                  ),
+                                  child: Icon(
+                                    _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+                                    color: Colors.orange,
+                                    size: 32,
+                                  ),
                                 ),
-                              ],
-                            ),
-                            child: Icon(
-                              _isRecording && !_isPaused
-                                  ? Icons.pause
-                                  : _isPaused
-                                      ? Icons.play_arrow
-                                      : _recordingDuration > 0
-                                          ? Icons.stop
-                                          : Icons.mic,
-                              size: 28,
-                              color: _isRecording && !_isPaused
-                                  ? Colors.red
-                                  : const Color(0xFF2E7D32),
+                              ),
+                              const SizedBox(width: 32),
+                              // STOP Button (Main)
+                              InkWell(
+                                onTap: _stopRecording,
+                                borderRadius: BorderRadius.circular(50),
+                                child: Container(
+                                  padding: const EdgeInsets.all(24),
+                                  decoration: BoxDecoration(
+                                    color: Colors.red.withOpacity(0.1),
+                                    shape: BoxShape.circle,
+                                    border: Border.all(color: Colors.red, width: 4),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: Colors.red.withOpacity(0.3),
+                                        blurRadius: 15,
+                                        spreadRadius: 2,
+                                      )
+                                    ],
+                                  ),
+                                  child: const Icon(Icons.stop_rounded, color: Colors.red, size: 48),
+                                ),
+                              ),
+                            ],
+                          )
+                        else
+                          // START Button
+                          InkWell(
+                            onTap: _selectedFolderName == null 
+                              ? () {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Please select a client first before recording'),
+                                      backgroundColor: Colors.orange,
+                                      duration: Duration(seconds: 2),
+                                    ),
+                                  );
+                                  _showRecordingClientDialog();
+                                }
+                              : _startRecording,
+                            borderRadius: BorderRadius.circular(50),
+                            child: Container(
+                              padding: const EdgeInsets.all(20),
+                              decoration: BoxDecoration(
+                                color: _selectedFolderName == null
+                                    ? Colors.grey.withOpacity(0.1)
+                                    : const Color(0xFF2E7D32).withOpacity(0.1),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: _selectedFolderName == null
+                                      ? Colors.grey
+                                      : const Color(0xFF2E7D32),
+                                  width: 3,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: (_selectedFolderName == null
+                                            ? Colors.grey
+                                            : const Color(0xFF2E7D32))
+                                        .withOpacity(0.3),
+                                    blurRadius: 15,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                              child: Icon(
+                                Icons.mic_rounded,
+                                size: 48,
+                                color: _selectedFolderName == null
+                                    ? Colors.grey
+                                    : const Color(0xFF2E7D32),
+                              ),
                             ),
                           ),
-                        ),
+                        // Disabled hint text
+                        if (_selectedFolderName == null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Select a client to enable recording',
+                            style: TextStyle(fontSize: 12, color: Colors.grey[500], fontStyle: FontStyle.italic),
+                          ),
+                        ],
                         const SizedBox(height: 16),
                         
                         // Real-time Transcription Box
@@ -3826,13 +4188,15 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                               Flexible(
                                 child: SingleChildScrollView(
                                   child: Text(
-                                    _isRecording || _recordingDuration > 0
-                                        ? 'Transcription will appear here as you speak...'
-                                        : 'Start recording to see live transcription',
+                                    _currentTranscript.isNotEmpty
+                                        ? _currentTranscript
+                                        : _isRecording 
+                                            ? 'Listening for speech...'
+                                            : 'Start recording to see live transcription',
                                     style: TextStyle(
-                                      fontSize: 13,
-                                      color: _isRecording
-                                          ? Colors.grey[800]
+                                      fontSize: 14,
+                                      color: _currentTranscript.isNotEmpty
+                                          ? Colors.black87
                                           : Colors.grey[400],
                                       height: 1.5,
                                     ),
@@ -3962,18 +4326,25 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     }
     
     try {
-      if (await _audioRecorder.hasPermission()) {
+      final session = await _audioService.startRecording();
+      if (session != null) {
         // Clear previous amplitude data
         _amplitudeLevels.clear();
         
-        // Start recording to stream (on web this typically buffers to blob)
-        // We pass '' as path to indicate we want a stream/blob on stop
-        await _audioRecorder.start(const RecordConfig(encoder: AudioEncoder.wav), path: '');
-        
+        print('🎙️ Started recording via Unified Service');
+      
+        // Start Web Speech Recognition
+        if (_isSpeechAvailable && _speechRecognition != null) {
+          _currentTranscript = ""; // Clear previous
+          _speechRecognition!.start();
+          print('🗣️ Speech Recognition Started');
+        }
+
+        // Start timer
+        _recordingDuration = 0;
         setState(() {
           _isRecording = true;
           _isPaused = false;
-          _recordingDuration = 0;
         });
         
         // Start timer
@@ -3986,19 +4357,12 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
           }
         });
         
-        // Listen to amplitude for visualization
-        _amplitudeSub = _audioRecorder.onAmplitudeChanged(const Duration(milliseconds: 100)).listen((amp) {
+        // Listen to amplitude for visualization (Service provides normalized 0-100 values)
+        _amplitudeSub = _audioService.amplitudeStream.listen((level) {
            if (!mounted) return;
-           // Normalize dB (-160 to 0) to 0.0 to 1.0
-           // Usually ranges from -60 (silence) to 0 (loud)
-           double level = (amp.current + 60) / 60; 
-           level = level.clamp(0.0, 1.0);
            
-           if (_amplitudeLevels.length > 45) {
-             _amplitudeLevels.removeAt(0);
-           }
            setState(() {
-             _amplitudeLevels.add(level);
+             _currentAmplitude = level;
            });
         });
         
@@ -4017,14 +4381,14 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
   }
 
   Future<void> _pauseRecording() async {
-    await _audioRecorder.pause();
+    await _audioService.pauseRecording();
     setState(() {
       _isPaused = true;
     });
   }
 
   Future<void> _resumeRecording() async {
-    await _audioRecorder.resume();
+    await _audioService.resumeRecording();
     setState(() {
       _isPaused = false;
     });
@@ -4038,9 +4402,15 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       _isRecording = false;
       _isPaused = false;
     });
+    
+    // Stop Speech Recognition
+    if (_isSpeechAvailable && _speechRecognition != null) {
+      _speechRecognition!.stop();
+      print('🗣️ Speech Recognition Stopped. Final: $_currentTranscript');
+    }
 
     try {
-      final path = await _audioRecorder.stop();
+      final path = await _audioService.stopRecording();
       if (path == null) {
         throw Exception('Recording stop failed: No path returned');
       }
@@ -4085,7 +4455,8 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         'duration_seconds': _recordingDuration,
         'status': 'processed', 
         'has_analysis': false, // Will become true after analysis
-        'source': 'web_dashboard'
+        'source': 'web_dashboard',
+        'transcription': _currentTranscript, // Save initial transcription
       });
       
       ScaffoldMessenger.of(context).showSnackBar(
@@ -4122,8 +4493,9 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
         filename: filename
       ));
       
-      // Add empty transcript for now (or implement STT later)
-      request.fields['transcript'] = ''; 
+      // Add transcript (from Web Speech API)
+      request.fields['transcript'] = _currentTranscript;
+      print('📝 Sending transcript: $_currentTranscript'); 
 
       print('🚀 Sending to API...');
       final streamedResponse = await request.send();
@@ -4135,34 +4507,70 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
          print('✅ API Analysis Complete');
          final result = jsonDecode(response.body);
          
-         // Save Result to Firestore 'biomarker_results'
-         await FirebaseFirestore.instance.collection('biomarker_results').add({
+         // 1. Prepare Data Matching Mobile Schema
+         final Map<String, dynamic> severity = {
+           'level': result['severity']['level'],
+           'confidence': result['severity']['confidence'],
+           'probabilities': result['severity']['probabilities'],
+         };
+         
+         final Map<String, dynamic> emotion = {
+           'label': result['emotion']['label'],
+           'confidence': result['emotion']['confidence'],
+         };
+         
+         // Fix Anxiety Indicators List validation
+         final List<dynamic> anxietyRaw = result['anxiety_indicators'] ?? [];
+         final List<Map<String, dynamic>> anxietyIndicators = anxietyRaw.map((i) => {
+           'name': i['name'],
+           'detected': i['detected'],
+           'probability': i['probability'],
+           'threshold': i['threshold'] ?? 0.0,
+           'supporting_evidence': i['supporting_evidence'], // Pass through supporting evidence
+         }).toList().cast<Map<String, dynamic>>();
+
+         // 2. Save to 'biomarker_results' collection
+         final docRef = await FirebaseFirestore.instance.collection('biomarker_results').add({
            'admin_id': _currentAdminId,
            'folder_name': _selectedFolderName,
-           'recording_id': recordingId, // Link to the recording doc
-           'file_name': filename, // Important for matching in charts!
+           'recording_id': recordingId,
+           'file_name': filename,
            'audio_name': filename,
            'date': Timestamp.now(),
+           'transcript': result['transcript'] ?? _currentTranscript,
+           'transcription': result['transcript'] ?? _currentTranscript, // Redundancy for safety
            
-           // Analysis Data from API
-           'severity': result['severity']['level'],
-           'severity_confidence': result['severity']['confidence'],
-           'severity_probabilities': result['severity']['probabilities'],
-           'emotion': result['emotion']['label'],
-           'emotion_confidence': result['emotion']['confidence'],
-           'summary': result['summary'],
-           
-           // Detailed Data
-           'anxiety_indicators': result['anxiety_indicators'], // List of maps
-           'features': result['features'], // Jitter, Shimmer, etc.
+           // Structured Analysis Data
+           'severity': severity,
+           'emotion': emotion,
+           'anxietyIndicators': anxietyIndicators, // CamelCase matching mobile model
+           'detectedConditions': result['detected_conditions'] ?? [],
+           'summary': result['summary'] ?? '',
+           'processingTimeMs': result['processing_time_ms'] ?? 0,
+           'extractedFeatures': result['features'], // Also keep in main doc for quick access if needed
          });
          
-         // Update Recording to show it has analysis
+         print('✅ Saved biomarker result ID: ${docRef.id}');
+
+         // 3. Save Features to Subcollection (Critical for detailed charts)
+         if (result['features'] != null) {
+           await docRef.collection('extracted_features').doc('all_features').set(
+             Map<String, dynamic>.from(result['features'])
+           );
+           print('✅ Saved extracted_features subcollection');
+         }
+         
+         // 4. Update 'recordings' document to link success
          await FirebaseFirestore.instance.collection('recordings').doc(recordingId).update({
            'has_analysis': true,
-           'severity': result['severity']['level']
+           'severity': result['severity']['level'],
+           'severity_score': result['severity']['confidence'], // Helpful for sorting
+           'emotion_label': result['emotion']['label'],
+           'transcription': result['transcript'] ?? _currentTranscript,
+           'biomarker_result_id': docRef.id, // Direct link
          });
          
+         // 5. Update UI
          final now = DateTime.now();
          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
          final formattedDate = '${months[now.month - 1]} ${now.day}, ${now.year} • ${now.hour > 12 ? now.hour - 12 : now.hour}:${now.minute.toString().padLeft(2, '0')} ${now.hour >= 12 ? 'PM' : 'AM'}';
@@ -4170,13 +4578,13 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
          ScaffoldMessenger.of(context).hideCurrentSnackBar();
          ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Analysis Complete! Opening report...'),
+            content: Text('Analysis Complete! Report Generated.'),
             backgroundColor: Colors.purple,
-            duration: Duration(seconds: 1),
+            duration: Duration(seconds: 2),
           ),
         );
         
-        // AUTO NAVIGATE: Switch to the Analysis Page for this new recording
+        // Auto-open Analysis View
         setState(() {
           _selectedAnalysisRecording = {
             'id': recordingId,
@@ -4185,7 +4593,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
             'date': formattedDate,
             'duration': _formatDuration(_recordingDuration),
             'admin_id': _currentAdminId ?? '',
-            'transcription': '', // No transcription from API yet
+            'transcription': result['transcript'] ?? _currentTranscript,
           };
         });
         
@@ -4641,6 +5049,447 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     );
   }
 
+  // ========== EXPORT REPORT DIALOG ==========
+  void _showExportReportDialog(BuildContext context, Map<String, dynamic> recording, Map<String, dynamic>? matchingResult) {
+    // Get client info
+    final folderName = recording['folder_name'] ?? recording['folder'] ?? '';
+    final client = _clients.firstWhere(
+      (c) => c['folder_name']?.toString() == folderName.toString(),
+      orElse: () => {'full_name': folderName, 'folder_name': folderName},
+    );
+    
+    // Extract analysis data
+    String severity = 'Unknown';
+    Color severityColor = Colors.grey;
+    String emotion = 'Unknown';
+    double emotionConfidence = 0;
+    List<Map<String, dynamic>> allIndicators = [];
+    String transcript = recording['transcription'] ?? '';
+    
+    if (matchingResult != null) {
+      final severityRaw = matchingResult['severity'];
+      if (severityRaw is Map) {
+        severity = severityRaw['level']?.toString() ?? 'Normal';
+      } else if (severityRaw is String) {
+        severity = severityRaw;
+      } else {
+        severity = matchingResult['severity_level']?.toString() ?? 'Normal';
+      }
+      
+      if (severity.toLowerCase() == 'severe') severityColor = Colors.red;
+      else if (severity.toLowerCase() == 'moderate') severityColor = Colors.orange;
+      else severityColor = Colors.green;
+      
+      final emotionRaw = matchingResult['emotion'];
+      if (emotionRaw is Map) {
+        emotion = emotionRaw['label']?.toString() ?? 'Neutral';
+        emotionConfidence = (emotionRaw['confidence'] as num?)?.toDouble() ?? 0;
+      } else if (emotionRaw is String) {
+        emotion = emotionRaw;
+        emotionConfidence = (matchingResult['emotion_confidence'] as num?)?.toDouble() ?? 0;
+      }
+      
+      final indicators = matchingResult['anxiety_indicators'] as List<dynamic>? ?? [];
+      for (var indicator in indicators) {
+        if (indicator is Map<String, dynamic>) {
+          allIndicators.add(indicator);
+        }
+      }
+      
+      transcript = matchingResult['transcript']?.toString() ?? recording['transcription'] ?? '';
+    }
+    
+    // Separate anxiety vs educational
+    const educationalNames = {
+      'Impostor Syndrome', 'Academic Burnout', 'Perfectionism',
+      'Fear Of Failure', 'Fear of Failure', 'Test Anxiety',
+      'Low Self-Esteem', 'Low Self Esteem',
+      'Lack of Support', 'Lack Of Academic Support',
+      'Pressure', 'Pressure Of Surroundings',
+      'Poor Time Management'
+    };
+    
+    List<Map<String, dynamic>> anxietyIndicators = [];
+    List<Map<String, dynamic>> educationalIndicators = [];
+    
+    for (var indicator in allIndicators) {
+      final name = indicator['name']?.toString() ?? '';
+      final detected = indicator['detected'] == true;
+      if (detected && name.isNotEmpty) {
+        if (educationalNames.contains(name)) {
+          educationalIndicators.add(indicator);
+        } else {
+          anxietyIndicators.add(indicator);
+        }
+      }
+    }
+    
+    // Get negative/absolutist words
+    final negativeWords = matchingResult?['negative_matches'] as List? ?? [];
+    final absolutistWords = matchingResult?['absolutist_matches'] as List? ?? [];
+    
+    // Get audio features
+    final jitter = (matchingResult?['jitter'] as num?)?.toDouble() ?? 0;
+    final shimmer = (matchingResult?['shimmer'] as num?)?.toDouble() ?? 0;
+    final hnr = (matchingResult?['hnr'] as num?)?.toDouble() ?? 0;
+    
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Container(
+          width: 800,
+          height: MediaQuery.of(context).size.height * 0.9,
+          child: Column(
+            children: [
+              // Header
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF2E7D32),
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.description, color: Colors.white, size: 28),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Audio Biomarker Analysis Report',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.print, color: Colors.white),
+                      onPressed: () {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Print functionality coming soon!')),
+                        );
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white),
+                      onPressed: () => Navigator.pop(ctx),
+                    ),
+                  ],
+                ),
+              ),
+              
+              // Report Content
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // CLIENT INFORMATION
+                      Row(
+                        children: [
+                          const Icon(Icons.person, size: 18, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          const Text('Client Information', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.blue)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 32, runSpacing: 8,
+                        children: [
+                          _buildReportField('Full Name', client['full_name']?.toString() ?? 'N/A'),
+                          _buildReportField('Age', client['age']?.toString() ?? 'N/A'),
+                          _buildReportField('Birthday', _formatBirthday(client['birthday'])),
+                          _buildReportField('School Year', client['school_year']?.toString() ?? 'N/A'),
+                          _buildReportField('Gender', client['gender']?.toString() ?? 'N/A'),
+                          _buildReportField('Phone', client['phone_number']?.toString() ?? 'N/A'),
+                        ],
+                      ),
+                      
+                      const SizedBox(height: 24),
+                      const Divider(),
+                      const SizedBox(height: 16),
+                      
+                      // PREDICTION ANALYTICS
+                      Row(
+                        children: [
+                          const Icon(Icons.analytics, size: 18, color: Colors.purple),
+                          const SizedBox(width: 8),
+                          const Text('Prediction Analytics', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.purple)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: severityColor.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: severityColor.withOpacity(0.3)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text('Severity Level', style: TextStyle(fontSize: 12, color: severityColor)),
+                                  Text(severity, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: severityColor)),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: Colors.purple.withOpacity(0.1),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.purple.withOpacity(0.3)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('Detected Emotion', style: TextStyle(fontSize: 12, color: Colors.purple)),
+                                  Text(emotion, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.purple)),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      
+                      const SizedBox(height: 16),
+                      
+                      // Anxiety & Educational
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.red.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('Anxiety Indicators', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                                  const SizedBox(height: 8),
+                                  Wrap(
+                                    spacing: 6, runSpacing: 6,
+                                    children: anxietyIndicators.isEmpty
+                                      ? [const Chip(label: Text('None Detected', style: TextStyle(fontSize: 11)))]
+                                      : anxietyIndicators.map((i) => Chip(
+                                          label: Text('${i['name']} (${i['probability']}%)', style: const TextStyle(fontSize: 11)),
+                                          backgroundColor: Colors.white,
+                                        )).toList(),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.teal.withOpacity(0.05),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('Educational Insights', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.teal)),
+                                  const SizedBox(height: 8),
+                                  Wrap(
+                                    spacing: 6, runSpacing: 6,
+                                    children: educationalIndicators.isEmpty
+                                      ? [const Chip(label: Text('No Issues', style: TextStyle(fontSize: 11)))]
+                                      : educationalIndicators.map((i) => Chip(
+                                          label: Text('${i['name']} (${i['probability']}%)', style: const TextStyle(fontSize: 11)),
+                                          backgroundColor: Colors.white,
+                                        )).toList(),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      
+                      const SizedBox(height: 24),
+                      const Divider(),
+                      const SizedBox(height: 16),
+                      
+                      // AI SUMMARY
+                      Row(
+                        children: [
+                          const Icon(Icons.auto_awesome, size: 18, color: Colors.deepPurple),
+                          const SizedBox(width: 8),
+                          const Text('AI Analysis Summary', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.deepPurple)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.deepPurple.withOpacity(0.05),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.deepPurple.withOpacity(0.2)),
+                        ),
+                        child: Text(
+                          matchingResult?['summary']?.toString() ?? 
+                          recording['summary']?.toString() ?? 
+                          'No summary available for this recording.',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.black87,
+                            height: 1.5,
+                          ),
+                        ),
+                      ),
+                      
+                      const SizedBox(height: 24),
+                      const Divider(),
+                      const SizedBox(height: 16),
+                      
+                      // CONFIDENCE ANALYSIS
+                      if (allIndicators.where((i) => i['detected'] == true).isNotEmpty) ...[
+                        Row(
+                          children: [
+                            const Icon(Icons.bar_chart, size: 18, color: Colors.blue),
+                            const SizedBox(width: 8),
+                            const Text('Confidence Analysis', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.blue)),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        ...allIndicators.where((i) => i['detected'] == true).take(5).map((indicator) {
+                          final prob = (indicator['probability'] as num?)?.toInt() ?? 0;
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: Row(
+                              children: [
+                                SizedBox(width: 150, child: Text(indicator['name'] ?? '', style: const TextStyle(fontSize: 13))),
+                                Expanded(
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(4),
+                                    child: LinearProgressIndicator(
+                                      value: prob / 100,
+                                      backgroundColor: Colors.grey[200],
+                                      valueColor: AlwaysStoppedAnimation(prob > 70 ? Colors.red : prob > 50 ? Colors.orange : Colors.green),
+                                      minHeight: 12,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Text('$prob%', style: TextStyle(fontWeight: FontWeight.bold, color: prob > 70 ? Colors.red : prob > 50 ? Colors.orange : Colors.green)),
+                              ],
+                            ),
+                          );
+                        }).toList(),
+                        const SizedBox(height: 24),
+                        const Divider(),
+                        const SizedBox(height: 16),
+                      ],
+                      
+                      // CLINICAL BIOMARKERS
+                      Row(
+                        children: [
+                          const Icon(Icons.science, size: 18, color: Colors.indigo),
+                          const SizedBox(width: 8),
+                          const Text('Clinical Biomarkers', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.indigo)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 12, runSpacing: 12,
+                        children: [
+                          _buildBiomarkerTag('Tremor', jitter > 0.03 ? 'Detected' : 'Normal', jitter > 0.03 ? Colors.orange : Colors.green),
+                          _buildBiomarkerTag('Breathing', shimmer > 0.15 ? 'Irregular' : 'Steady', shimmer > 0.15 ? Colors.orange : Colors.green),
+                          _buildBiomarkerTag('Tension', hnr < 10 && hnr > 0 ? 'Tense' : 'Relaxed', hnr < 10 && hnr > 0 ? Colors.orange : Colors.green),
+                          _buildBiomarkerTag('Distress', '${negativeWords.length}', negativeWords.isNotEmpty ? Colors.red : Colors.green),
+                        ],
+                      ),
+                      
+                      const SizedBox(height: 24),
+                      const Divider(),
+                      const SizedBox(height: 16),
+                      
+                      // TRANSCRIPTION
+                      Row(
+                        children: [
+                          const Icon(Icons.record_voice_over, size: 18, color: Colors.blueGrey),
+                          const SizedBox(width: 8),
+                          const Text('Analyzed Transcription', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[50],
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey[300]!),
+                        ),
+                        child: SelectableText(
+                          transcript.isNotEmpty ? transcript : 'No transcription available',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontStyle: transcript.isEmpty ? FontStyle.italic : FontStyle.normal,
+                            color: transcript.isEmpty ? Colors.grey : Colors.black87,
+                            height: 1.5,
+                          ),
+                        ),
+                      ),
+                      
+                      const SizedBox(height: 24),
+                      Center(
+                        child: Text(
+                          'Generated on ${DateTime.now().toString().substring(0, 19)} • Audio Biomarker Analysis System',
+                          style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildReportField(String label, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+        Text(value, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+      ],
+    );
+  }
+  
+  Widget _buildBiomarkerTag(String label, String value, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('$label: ', style: const TextStyle(fontSize: 12)),
+          Text(value, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: color)),
+        ],
+      ),
+    );
+  }
+
   Widget _buildPredictionAnalysisPage() {
     final recording = _selectedAnalysisRecording!;
     
@@ -4657,26 +5506,44 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     List<String> educationalIssues = [];
     
     if (matchingResult != null) {
-      final severityData = matchingResult['severity'] as Map<String, dynamic>? ?? {};
-      severity = severityData['level']?.toString() ?? 'Normal';
+      final severityRaw = matchingResult['severity'];
+      if (severityRaw is Map) {
+         severity = severityRaw['level']?.toString() ?? 'Normal';
+      } else if (severityRaw is String) {
+         severity = severityRaw;
+      } else {
+         severity = 'Normal';
+      }
       
       if (severity.toLowerCase() == 'severe') severityColor = Colors.red;
       else if (severity.toLowerCase() == 'moderate') severityColor = Colors.orange;
       else severityColor = Colors.green;
       
-      final emotionData = matchingResult['emotion'] as Map<String, dynamic>? ?? {};
-      emotion = emotionData['label']?.toString() ?? 'Neutral';
+      final emotionRaw = matchingResult['emotion'];
+      if (emotionRaw is Map) {
+         emotion = emotionRaw['label']?.toString() ?? 'Neutral';
+      } else if (emotionRaw is String) {
+         emotion = emotionRaw;
+      } else {
+         emotion = 'Neutral';
+      }
       
       final indicators = matchingResult['anxiety_indicators'] as List<dynamic>? ?? [];
-      const educationalNames = {'Impostor Syndrome', 'Academic Burnout', 'Perfectionism', 
-                                'Fear Of Failure', 'Fear of Failure', 'Test Anxiety'};
+      const educationalNames = {
+        'Impostor Syndrome', 'Academic Burnout', 'Perfectionism', 
+        'Fear Of Failure', 'Fear of Failure', 'Test Anxiety',
+        'Low Self-Esteem', 'Low Self Esteem',
+        'Lack of Support', 'Lack Of Academic Support',
+        'Pressure', 'Pressure Of Surroundings',
+        'Poor Time Management'
+      };
       
       for (var indicator in indicators) {
         final name = indicator['name']?.toString() ?? '';
         final detected = indicator['detected'] == true;
         final probability = (indicator['probability'] as num?)?.toInt() ?? 0;
         
-        if (detected && name.isNotEmpty && probability > 80) {
+        if (detected && name.isNotEmpty) {
           if (educationalNames.contains(name)) educationalIssues.add('$name ($probability%)');
           else anxietyTypes.add('$name ($probability%)');
         }
@@ -4729,7 +5596,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                 ),
                 ElevatedButton.icon(
                   onPressed: () { 
-                     // TODO: Export logic
+                     _showExportReportDialog(context, recording, matchingResult);
                   },
                   icon: const Icon(Icons.download, size: 16),
                   label: const Text('Export Report', style: TextStyle(fontSize: 13)),
@@ -4749,241 +5616,295 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Row: Client Info & Audio Player
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // Client Info (Flex 5)
-                      Expanded(
-                        flex: 5,
-                        child: Container(
-                          height: 140,
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                             boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                  // Client Information - FULL WIDTH
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                       boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Client Information', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 16),
+                        Builder(builder: (context) {
+                          final folderName = recording['folder_name'];
+                          final client = _clients.firstWhere(
+                            (c) => c['folder_name'].toString() == folderName.toString(),
+                            orElse: () => {'full_name': folderName ?? 'Unknown', 'folder_name': folderName},
+                          );
+                          
+                          return Wrap(
+                            spacing: 32, runSpacing: 12,
                             children: [
-                              const Text('Client Information', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                              const Spacer(),
-                              Builder(builder: (context) {
-                                final folderName = recording['folder_name'];
-                                final client = _clients.firstWhere(
-                                  (c) => c['folder_name'].toString() == folderName.toString(),
-                                  orElse: () => {'full_name': folderName ?? 'Unknown', 'folder_name': folderName},
-                                );
-                                
-                                return Wrap(
-                                  spacing: 24, runSpacing: 8,
-                                  children: [
-                                     _buildInfoItem('Full Name', client['full_name']?.toString() ?? 'N/A'),
-                                     _buildInfoItem('Age', client['age']?.toString() ?? 'N/A'),
-                                     _buildInfoItem('Birthday', _formatBirthday(client['birthday'])),
-                                     _buildInfoItem('School Year', client['school_year']?.toString() ?? 'N/A'),
-                                  ],
-                                );
-                              }),
-                              const Spacer(), 
+                               _buildInfoItem('Full Name', client['full_name']?.toString() ?? 'N/A'),
+                               _buildInfoItem('Age', client['age']?.toString() ?? 'N/A'),
+                               _buildInfoItem('Birthday', _formatBirthday(client['birthday'])),
+                               _buildInfoItem('School Year', client['school_year']?.toString() ?? 'N/A'),
+                               _buildInfoItem('Gender', client['gender']?.toString() ?? 'N/A'),
+                               _buildInfoItem('Phone', client['phone_number']?.toString() ?? 'N/A'),
                             ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 16),
-                      // Audio Player (Flex 4)
-                      Expanded(
-                        flex: 4,
-                        child: Container(
-                          height: 140,
-                          padding: const EdgeInsets.all(16),
-                           decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                             boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('Audio Analysis', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                              const SizedBox(height: 12),
-                              Expanded(
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFFFAFAFA),
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(color: Colors.grey[200]!),
-                                  ),
-                                  child: Stack(
-                                    alignment: Alignment.center,
-                                    children: [
-                                      // Visualizer
-                                      // Visualizer
-                                      Builder(builder: (context) {
-                                         // Safely extract waveform list - prioritize saved metadata
-                                         List<dynamic> wave = (recording['waveform_data'] as List<dynamic>?) 
-                                            ?? (matchingResult?['features'] as Map<String, dynamic>?)?['waveform'] 
-                                            ?? [];
-                                         
-                                         if (wave.isEmpty) {
-                                            // Fallback dummy
-                                            return Row(
-                                              mainAxisAlignment: MainAxisAlignment.center,
-                                              children: List.generate(40, (i) => Container(
-                                                margin: const EdgeInsets.symmetric(horizontal: 2),
-                                                width: 3,
-                                                height: 10.0 + (i % 5) * 6,
-                                                color: const Color(0xFF2E7D32).withOpacity(0.5),
-                                              )),
-                                            );
-                                         }
-                                         
-                                         // Render Actual Waveform
-                                         return Row(
-                                            mainAxisAlignment: MainAxisAlignment.center,
-                                            children: wave.map((val) {
-                                               double norm = (val as num).toDouble();
-                                               double h = norm * 40.0; // Scale to height
-                                               if (h < 4) h = 4;
-                                               return Container(
-                                                  margin: const EdgeInsets.symmetric(horizontal: 1.5),
-                                                  width: 3,
-                                                  height: h,
-                                                  decoration: BoxDecoration(
-                                                    color: const Color(0xFF2E7D32).withOpacity(0.4 + (norm * 0.6)),
-                                                    borderRadius: BorderRadius.circular(1.5)
-                                                  ),
-                                               );
-                                            }).toList(),
-                                         );
-                                      }),
-                                      const Icon(Icons.play_circle_fill, color: Color(0xFF2E7D32), size: 40),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
+                          );
+                        }),
+                      ],
+                    ),
                   ),
                   
                   const SizedBox(height: 16),
                   
-                  // Row: Prediction (Flex 2) & Transcription (Flex 1)
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                       Expanded(
-                         flex: 2,
-                         child: Container(
-                            padding: const EdgeInsets.all(16),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(12),
-                               boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                const Text('Prediction Analytics', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                                const SizedBox(height: 16),
-                                Row(
-                                  children: [
-                                    Expanded(child: _buildCompactAnalyticsItem('Severity Level', severity, severityColor)),
-                                    const SizedBox(width: 12),
-                                    Expanded(child: _buildCompactAnalyticsItem('Detected Emotion', emotion, Colors.purple)),
-                                  ],
+                  // Prediction Analytics - FULL WIDTH
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                       boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Prediction Analytics', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Expanded(child: _buildCompactAnalyticsItem('Severity Level', severity, severityColor)),
+                            const SizedBox(width: 12),
+                            Expanded(child: _buildCompactAnalyticsItem('Detected Emotion', emotion, Colors.purple)),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.blue.withOpacity(0.04),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: Colors.blue.withOpacity(0.1)),
                                 ),
-                                const SizedBox(height: 16),
-                                Row(
+                                child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Expanded(
-                                      child: Container(
-                                        padding: const EdgeInsets.all(12),
-                                        decoration: BoxDecoration(
-                                          color: Colors.blue.withOpacity(0.04),
-                                          borderRadius: BorderRadius.circular(8),
-                                          border: Border.all(color: Colors.blue.withOpacity(0.1)),
-                                        ),
-                                        child: Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
-                                          children: [
-                                            const Text('Anxiety Indicators', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
-                                            const SizedBox(height: 8),
-                                            Wrap(
-                                              spacing: 6, runSpacing: 6,
-                                              children: anxietyTypes.map((t) => Chip(
-                                                label: Text(t, style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
-                                                backgroundColor: Colors.white,
-                                                labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                                                padding: EdgeInsets.zero,
-                                                visualDensity: VisualDensity.compact,
-                                                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4), side: BorderSide(color: Colors.blueGrey.withOpacity(0.1))),
-                                              )).toList(),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 12),
-                                    Expanded(
-                                      child: Container(
-                                        padding: const EdgeInsets.all(12),
-                                        decoration: BoxDecoration(
-                                          color: Colors.teal.withOpacity(0.04),
-                                          borderRadius: BorderRadius.circular(8),
-                                          border: Border.all(color: Colors.teal.withOpacity(0.1)),
-                                        ),
-                                        child: Column(
-                                          crossAxisAlignment: CrossAxisAlignment.start,
-                                          children: [
-                                            const Text('Educational Insights', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.teal)),
-                                            const SizedBox(height: 8),
-                                            Wrap(
-                                              spacing: 6, runSpacing: 6,
-                                              children: educationalIssues.map((t) => Chip(
-                                                label: Text(t, style: const TextStyle(fontSize: 10, color: Colors.teal)),
-                                                backgroundColor: Colors.white,
-                                                labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-                                                padding: EdgeInsets.zero,
-                                                visualDensity: VisualDensity.compact,
-                                                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4), side: BorderSide(color: Colors.teal.withOpacity(0.1))),
-                                              )).toList(),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
+                                    const Text('Anxiety Indicators', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blueGrey)),
+                                    const SizedBox(height: 8),
+                                    Wrap(
+                                      spacing: 6, runSpacing: 6,
+                                      children: anxietyTypes.map((t) => Chip(
+                                        label: Text(t, style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
+                                        backgroundColor: Colors.white,
+                                        labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+                                        padding: EdgeInsets.zero,
+                                        visualDensity: VisualDensity.compact,
+                                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4), side: BorderSide(color: Colors.blueGrey.withOpacity(0.1))),
+                                      )).toList(),
                                     ),
                                   ],
                                 ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Container(
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: Colors.teal.withOpacity(0.04),
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: Colors.teal.withOpacity(0.1)),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text('Educational Insights', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.teal)),
+                                    const SizedBox(height: 8),
+                                    Wrap(
+                                      spacing: 6, runSpacing: 6,
+                                      children: educationalIssues.map((t) => Chip(
+                                        label: Text(t, style: const TextStyle(fontSize: 10, color: Colors.teal)),
+                                        backgroundColor: Colors.white,
+                                        labelPadding: const EdgeInsets.symmetric(horizontal: 4),
+                                        padding: EdgeInsets.zero,
+                                        visualDensity: VisualDensity.compact,
+                                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4), side: BorderSide(color: Colors.teal.withOpacity(0.1))),
+                                      )).toList(),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // AI Summary Box - fetched from Firebase biomarker_results
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.deepPurple.withOpacity(0.05),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.deepPurple.withOpacity(0.2)),
+                      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.auto_awesome, size: 18, color: Colors.deepPurple),
+                            const SizedBox(width: 8),
+                            const Text('AI Analysis Summary', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.deepPurple)),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          matchingResult?['summary']?.toString() ?? 
+                          recording['summary']?.toString() ?? 
+                          'No summary available for this recording.',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.black87,
+                            height: 1.5,
+                            fontStyle: (matchingResult?['summary'] == null && recording['summary'] == null) 
+                              ? FontStyle.italic 
+                              : FontStyle.normal,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // Waveform/Audio Analysis - FULL WIDTH (above anxiety conditions)
+                  Container(
+                    height: 120,
+                    padding: const EdgeInsets.all(16),
+                     decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(12),
+                       boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Audio Analysis', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 12),
+                        Expanded(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFFAFAFA),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.grey[200]!),
+                            ),
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                // Visualizer
+                                Builder(builder: (context) {
+                                   List<dynamic> wave = (recording['waveform_data'] as List<dynamic>?) 
+                                      ?? (matchingResult?['extracted_features'] as Map<String, dynamic>?)?['waveform'] 
+                                      ?? [];
+                                   
+                                   if (wave.isEmpty) {
+                                      return Row(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: List.generate(80, (i) => Container(
+                                          margin: const EdgeInsets.symmetric(horizontal: 1),
+                                          width: 3,
+                                          height: 10.0 + (i % 5) * 6,
+                                          color: const Color(0xFF2E7D32).withOpacity(0.5),
+                                        )),
+                                      );
+                                   }
+                                   
+                                   int startIndex = 0;
+                                   for (int i = 0; i < wave.length; i++) {
+                                     if ((wave[i] as num).toDouble() > 0.1) {
+                                       startIndex = i;
+                                       break;
+                                     }
+                                   }
+                                   List<dynamic> activeWave = wave.sublist(startIndex);
+                                   
+                                   return Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: activeWave.map((val) {
+                                         double rawVal = (val as num).toDouble();
+                                         double norm = rawVal > 1.0 ? (rawVal / 100.0).clamp(0.0, 1.0) : rawVal.clamp(0.0, 1.0);
+                                         double h = norm * 40.0;
+                                         if (h < 3) h = 3;
+                                         return Container(
+                                            margin: const EdgeInsets.symmetric(horizontal: 0.5),
+                                            width: 3,
+                                            height: h,
+                                            decoration: BoxDecoration(
+                                              color: Color(0xFF2E7D32).withOpacity((0.5 + (norm * 0.5)).clamp(0.0, 1.0)),
+                                              borderRadius: BorderRadius.circular(1)
+                                            ),
+                                         );
+                                      }).toList(),
+                                   );
+                                }),
                               ],
                             ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  
+                  const SizedBox(height: 24),
+                  
+                  // Row: Specific Anxiety Conditions (left) + Transcription (right)
+                  Builder(builder: (context) {
+                     List<dynamic> allInds = matchingResult?['anxiety_indicators'] as List<dynamic>? ?? [];
+                     final clinicalNames = ['Social Anxiety', 'GAD', 'Agoraphobia', 'Panic Disorder', 'PTSD'];
+                     var clinical = allInds.where((i) => clinicalNames.contains(i['name'])).toList();
+                     
+                     return Row(
+                       crossAxisAlignment: CrossAxisAlignment.start,
+                       children: [
+                         // Specific Anxiety Conditions (left)
+                         Expanded(
+                           flex: 2,
+                           child: _buildConditionAnalytics(
+                               "Specific Anxiety Conditions", 
+                               "Deep dive into specific anxiety types and their multimodal triggers.", 
+                               clinical, 
+                               matchingResult?['extracted_features'] as Map<String, dynamic>?,
+                               isEducational: false,
+                               transcript: recording['transcription'] as String?
+                           ),
                          ),
-                       ),
-                       const SizedBox(width: 16),
-                       Expanded(
-                         flex: 1,
-                         child: Container(
-                            height: 300,
-                            padding: const EdgeInsets.all(16),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(12),
-                               boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
-                            ),
-                            child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('Transcription', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                              const SizedBox(height: 12),
-                              Expanded(
-                                child: Container(
+                         const SizedBox(width: 16),
+                         // Transcription (right)
+                         Expanded(
+                           flex: 1,
+                           child: Container(
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: Colors.white,
+                                borderRadius: BorderRadius.circular(12),
+                                 boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)],
+                              ),
+                              child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Transcription', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                                const SizedBox(height: 12),
+                                Container(
+                                  constraints: const BoxConstraints(minHeight: 150),
                                   padding: const EdgeInsets.all(12),
                                   decoration: BoxDecoration(
                                     color: const Color(0xFFFAFAFA),
@@ -4992,60 +5913,66 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                                   child: SingleChildScrollView(
                                     child: _buildHighlightedTranscript(
                                       recording['transcription']?.isNotEmpty == true ? recording['transcription']! : 'No transcription available.',
-                                      matchingResult?['features'] as Map<String, dynamic>?
+                                      matchingResult?['extracted_features'] as Map<String, dynamic>?
                                     ),
                                   ),
                                 ),
-                              ),
-                            ],
-                          ),
+                              ],
+                            ),
+                           ),
                          ),
-                       ),
-                    ],
-
-                  ),
+                       ],
+                     );
+                  }),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // Educational Insights (separate section)
+                  Builder(builder: (context) {
+                     List<dynamic> allInds = matchingResult?['anxiety_indicators'] as List<dynamic>? ?? [];
+                     final clinicalNames = ['Social Anxiety', 'GAD', 'Agoraphobia', 'Panic Disorder', 'PTSD'];
+                     var educational = allInds.where((i) => !clinicalNames.contains(i['name'])).toList();
+                     
+                     return _buildConditionAnalytics(
+                         "Educational Insights", 
+                         "AI analysis of academic performance and cognitive stressors.", 
+                         educational, 
+                         matchingResult?['extracted_features'] as Map<String, dynamic>?,
+                         isEducational: true,
+                         transcript: recording['transcription'] as String?
+                     );
+                  }),
                   const SizedBox(height: 24),
-                  // Explanation & Decision Logic
-                  _buildEmotionAnalytics(
-                     matchingResult?['emotion']?.toString() ?? 'Neutral',
-                     (matchingResult?['emotion_confidence'] as num?)?.toInt() ?? 0,
-                     matchingResult?['features'] as Map<String, dynamic>?
-                  ),
+                  // Explanation & Decision Logic (Neural Emotion Analysis)
+                  Builder(builder: (context) {
+                    // Handle emotion as either map {label, confidence} or flat string
+                    final emotionRaw = matchingResult?['emotion'];
+                    String emotionLabel;
+                    int emotionConf;
+                    if (emotionRaw is Map) {
+                      emotionLabel = emotionRaw['label']?.toString() ?? 'Neutral';
+                      emotionConf = (emotionRaw['confidence'] as num?)?.toInt() ?? 0;
+                    } else {
+                      emotionLabel = emotionRaw?.toString() ?? 'Neutral';
+                      emotionConf = (matchingResult?['emotion_confidence'] as num?)?.toInt() ?? 0;
+                    }
+                    // Fallback to extracted_features.detected_emotion if available
+                    final features = matchingResult?['extracted_features'] as Map<String, dynamic>?;
+                    if (emotionLabel == 'Neutral' || emotionLabel.isEmpty) {
+                      emotionLabel = features?['detected_emotion']?.toString() ?? emotionLabel;
+                    }
+                    if (emotionConf == 0) {
+                      emotionConf = ((features?['emotion_confidence'] as num?)?.toDouble() ?? 0.0 * 100).toInt();
+                    }
+                    return _buildEmotionAnalytics(emotionLabel, emotionConf, features);
+                  }),
                   const SizedBox(height: 24),
                   _buildPredictionExplainability(
                     severity, 
                     (matchingResult?['severity_confidence'] as num?)?.toInt() ?? 0,
-                     matchingResult?['features'] as Map<String, dynamic>?,
+                     matchingResult?['extracted_features'] as Map<String, dynamic>?,
                      matchingResult?['severity_probabilities'] as Map<String, dynamic>?
                   ),
-                  const SizedBox(height: 24),
-                  // Split Clinical vs Educational
-                  Builder(builder: (context) {
-                     List<dynamic> allInds = matchingResult?['anxiety_indicators'] as List<dynamic>? ?? [];
-                     final clinicalNames = ['Social Anxiety', 'GAD', 'Agoraphobia', 'Panic Disorder', 'PTSD'];
-                     
-                     var clinical = allInds.where((i) => clinicalNames.contains(i['name'])).toList();
-                     var educational = allInds.where((i) => !clinicalNames.contains(i['name'])).toList();
-                     
-                     return Column(
-                       children: [
-                          _buildConditionAnalytics(
-                              "Specific Anxiety Conditions", 
-                              "Deep dive into specific anxiety types and their multimodal triggers.", 
-                              clinical, 
-                              matchingResult?['features'] as Map<String, dynamic>?,
-                              isEducational: false
-                          ),
-                          _buildConditionAnalytics(
-                              "Educational Insights", 
-                              "AI analysis of academic performance and cognitive stressors.", 
-                              educational, 
-                              matchingResult?['features'] as Map<String, dynamic>?,
-                              isEducational: true
-                          ),
-                       ],
-                     );
-                  }),
                 ],
               ),
             ),
@@ -5091,20 +6018,46 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     final hnr = (features?['hnr'] as num?)?.toDouble() ?? 0.0;
     
     // Exact metadata numbers (Formatted)
-    String jitterVal = '${(jitter * 100).toStringAsFixed(3)}%'; 
-    String shimmerVal = '${(shimmer * 100).toStringAsFixed(3)}%'; 
+    // Note: jitter and shimmer from Firebase are already percentage values (e.g., 10 = 10%, not 0.10)
+    String jitterVal = '${jitter.toStringAsFixed(3)}%'; 
+    String shimmerVal = '${shimmer.toStringAsFixed(3)}%'; 
     String hnrVal = '${hnr.toStringAsFixed(2)} dB'; 
     
     // Probabilities handling
-    int normalProb = (probabilities?['Normal'] as num?)?.toInt() ?? (severity == 'Normal' ? confidence : 0);
-    int moderateProb = (probabilities?['Moderate'] as num?)?.toInt() ?? (severity == 'Moderate' ? confidence : 0);
-    int severeProb = (probabilities?['Severe'] as num?)?.toInt() ?? (severity == 'Severe' ? confidence : 0);
+    // First, try to get emotion_confidence from features as a fallback for confidence
+    int effectiveConfidence = confidence;
+    if (effectiveConfidence == 0 && features != null) {
+      // emotion_confidence in Firebase is stored as 0.0-1.0, convert to percentage
+      final emotionConf = (features['emotion_confidence'] as num?)?.toDouble() ?? 0.0;
+      effectiveConfidence = (emotionConf * 100).toInt();
+      // If still 0, use a default confidence of 50
+      if (effectiveConfidence == 0) effectiveConfidence = 50;
+    }
+    
+    // Map 'Neutral' emotion to 'Normal' severity if severity is not explicitly set
+    String effectiveSeverity = severity;
+    if (severity.isEmpty || severity == 'Unknown') {
+      final detectedEmotion = features?['detected_emotion']?.toString() ?? '';
+      if (detectedEmotion == 'Neutral' || detectedEmotion == 'Happy' || detectedEmotion == 'Calm') {
+        effectiveSeverity = 'Normal';
+      } else if (detectedEmotion == 'Sad' || detectedEmotion == 'Fear') {
+        effectiveSeverity = 'Moderate';
+      } else if (detectedEmotion == 'Angry' || detectedEmotion == 'Disgust') {
+        effectiveSeverity = 'Severe';
+      } else {
+        effectiveSeverity = 'Normal'; // Default to Normal
+      }
+    }
+    
+    int normalProb = (probabilities?['Normal'] as num?)?.toInt() ?? (effectiveSeverity == 'Normal' ? effectiveConfidence : 0);
+    int moderateProb = (probabilities?['Moderate'] as num?)?.toInt() ?? (effectiveSeverity == 'Moderate' ? effectiveConfidence : 0);
+    int severeProb = (probabilities?['Severe'] as num?)?.toInt() ?? (effectiveSeverity == 'Severe' ? effectiveConfidence : 0);
     
     // Fill gaps if strictly limited info (e.g. old records)
     if (probabilities == null) {
-       int remainder = 100 - confidence;
-       if (severity == 'Normal') { moderateProb = remainder ~/ 2; severeProb = remainder - moderateProb; }
-       else if (severity == 'Moderate') { normalProb = remainder ~/ 2; severeProb = remainder - normalProb; }
+       int remainder = 100 - effectiveConfidence;
+       if (effectiveSeverity == 'Normal') { moderateProb = remainder ~/ 2; severeProb = remainder - moderateProb; }
+       else if (effectiveSeverity == 'Moderate') { normalProb = remainder ~/ 2; severeProb = remainder - normalProb; }
        else { normalProb = remainder ~/ 2; moderateProb = remainder - normalProb; }
     }
     
@@ -5112,26 +6065,26 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     // Detailed Explanation Logic
     String explanation = "";
     
-    if (severity == 'Normal') {
-       explanation = "The analysis suggests a **Normal** state ($confidence% confidence). ";
-       if (jitter < 0.012 && shimmer < 0.05) {
+    if (effectiveSeverity == 'Normal') {
+       explanation = "The analysis suggests a **Normal** state ($effectiveConfidence% confidence). ";
+       if (jitter < 1.2 && shimmer < 5.0) {
          explanation += "Acoustic biomarkers are well within the healthy baseline. Low Jitter ($jitterVal) and Shimmer ($shimmerVal) indicate consistent and stable vocal fold vibration, typical of a relaxed physiological state.";
        } else {
          explanation += "While overall stable, slight variations in acoustic intensity were noted ($shimmerVal Shimmer), though they remain below the threshold for clinical concern.";
        }
-    } else if (severity == 'Moderate') {
-       explanation = "The analysis detects **Moderate** signs of anxiety ($confidence% confidence). ";
+    } else if (effectiveSeverity == 'Moderate') {
+       explanation = "The analysis detects **Moderate** signs of anxiety ($effectiveConfidence% confidence). ";
        explanation += "The model identified irregularities in vocal frequency and amplitude. ";
        
-       if (jitter > 0.015) {
+       if (jitter > 1.5) {
           explanation += "Elevated Jitter ($jitterVal) points to micro-fluctuations in pitch often caused by muscle tension. ";
-       } else if (shimmer > 0.05) {
+       } else if (shimmer > 5.0) {
           explanation += "High Shimmer ($shimmerVal) suggests inconsistent loudness control, a common indicator of underlying stress. ";
        } else {
           explanation += "Combined acoustic features deviate from the stable baseline, consistent with elevated stress levels. ";
        }
-    } else if (severity == 'Severe') {
-       explanation = "The analysis indicates a **Severe** anxiety classification ($confidence% confidence). ";
+    } else if (effectiveSeverity == 'Severe') {
+       explanation = "The analysis indicates a **Severe** anxiety classification ($effectiveConfidence% confidence). ";
        explanation += "Significant acoustic perturbations were detected. ";
        
        if (hnr < 20) {
@@ -5139,7 +6092,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
        }
        explanation += "High vocal instability (Jitter $jitterVal) combined with these features strongly correlates with acute physiological distress.";
     } else {
-       explanation = "The model predicts a $severity level ($confidence%). Acoustic markers include Jitter ($jitterVal), Shimmer ($shimmerVal), and HNR ($hnrVal).";
+       explanation = "The model predicts a $effectiveSeverity level ($effectiveConfidence%). Acoustic markers include Jitter ($jitterVal), Shimmer ($shimmerVal), and HNR ($hnrVal).";
     }
 
     return Container(
@@ -5192,9 +6145,10 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
               spacing: 24,
               runSpacing: 16,
               children: [
-                 _buildBiomarkerMetric('Vocal Stability (Jitter)', jitterVal, jitter / 0.05, Colors.blue),
-                 _buildBiomarkerMetric('Amplitude Perturbation (Shimmer)', shimmerVal, shimmer / 0.1, Colors.teal),
-                 _buildBiomarkerMetric('Harmonic-to-Noise (HNR)', hnrVal, (hnr > 0 ? hnr / 30.0 : 0.0), Colors.purple),
+                 // Normalize for display: jitter typically 0-5%, shimmer 0-10%, HNR 0-30dB
+                 _buildBiomarkerMetric('Vocal Stability (Jitter)', jitterVal, (jitter / 5.0).clamp(0.0, 1.0), Colors.blue),
+                 _buildBiomarkerMetric('Amplitude Perturbation (Shimmer)', shimmerVal, (shimmer / 15.0).clamp(0.0, 1.0), Colors.teal),
+                 _buildBiomarkerMetric('Harmonic-to-Noise (HNR)', hnrVal, (hnr / 30.0).clamp(0.0, 1.0), Colors.purple),
               ],
             ),
          ],
@@ -5253,6 +6207,10 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
   }
 
   Widget _buildEmotionAnalytics(String emotion, int confidence, Map<String, dynamic>? features) {
+     // Debug: Print what we're receiving
+     print('🎯 _buildEmotionAnalytics features keys: ${features?.keys.toList()}');
+     print('🎯 pitch_mean: ${features?['pitch_mean']}, energy_mean: ${features?['energy_mean']}');
+     
      final pitch = (features?['pitch_mean'] as num?)?.toDouble() ?? 120.0;
      final energy = (features?['energy_mean'] as num?)?.toDouble() ?? 0.05;
      
@@ -5300,7 +6258,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                       const SizedBox(height: 16),
                       _buildSliderMetric('Pitch (Tone)', pitchNorm, '${pitch.toStringAsFixed(0)} Hz', Colors.blue),
                       const SizedBox(height: 12),
-                      _buildSliderMetric('Energy (Intensity)', energyNorm, floatToLevel(energyNorm), Colors.orange),
+                      _buildSliderMetric('Energy (Intensity)', energyNorm, '${energy.toStringAsFixed(3)} (${floatToLevel(energyNorm)})', Colors.orange),
                     ],
                   ),
                 ),
@@ -5335,7 +6293,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                  const SizedBox(width: 12),
                  Expanded(
                    child: Text(
-                     generateFusionSummary(emotion, pitchNorm, energyNorm, negativeCount),
+                     generateFusionSummary(emotion, confidence, pitchNorm, energyNorm, negativeCount),
                      style: const TextStyle(fontSize: 13, color: Colors.purple, fontStyle: FontStyle.italic),
                    ),
                  ),
@@ -5392,8 +6350,8 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     return 'High';
   }
 
-  String generateFusionSummary(String emotion, double pitch, double energy, int negCount) {
-    String reason = "Predicted **$emotion** based on ";
+  String generateFusionSummary(String emotion, int confidence, double pitch, double energy, int negCount) {
+    String reason = "Predicted **$emotion** (confidence: $confidence%) based on ";
     List<String> factors = [];
     if (emotion == 'Sad' || emotion == 'Neutral') {
        if (pitch < 0.4) factors.add("low vocal pitch");
@@ -5411,8 +6369,11 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
     return reason + factors.join(' and ') + ".";
   }
 
-  Widget _buildConditionAnalytics(String title, String subtitle, List<dynamic> indicators, Map<String, dynamic>? features, {required bool isEducational}) {
+  Widget _buildConditionAnalytics(String title, String subtitle, List<dynamic> indicators, Map<String, dynamic>? features, {required bool isEducational, String? transcript}) {
       final detected = indicators.where((i) => i['detected'] == true).toList();
+      
+      // Build explanation based on features
+      String explanation = _buildExplainableAI(features, detected, isEducational, transcript);
       
       return Container(
          width: double.infinity,
@@ -5442,6 +6403,7 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(color: Colors.green.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
                   child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                        const Icon(Icons.check_circle, color: Colors.green),
                        const SizedBox(width: 12),
@@ -5458,41 +6420,603 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                ...detected.take(3).map((indicator) {
                    return _buildIndicatorCard(indicator, features);
                }).toList(),
+             
+             // Confidence Analysis Graph
+             if (detected.isNotEmpty) _buildConfidenceGraph(detected, isEducational),
+
+             // Explainable AI Section
+             const SizedBox(height: 20),
+             Container(
+               padding: const EdgeInsets.all(16),
+               decoration: BoxDecoration(
+                 color: Colors.blue.withOpacity(0.05),
+                 borderRadius: BorderRadius.circular(12),
+                 border: Border.all(color: Colors.blue.withOpacity(0.2)),
+               ),
+               child: Column(
+                 crossAxisAlignment: CrossAxisAlignment.start,
+                 children: [
+                   Row(
+                     children: [
+                       Icon(Icons.psychology, color: Colors.blue[700], size: 20),
+                       const SizedBox(width: 8),
+                       Text('AI Prediction Explanation', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue[700], fontSize: 14)),
+                     ],
+                   ),
+                   const SizedBox(height: 12),
+                   Text(
+                     explanation,
+                     style: TextStyle(fontSize: 12, color: Colors.grey[700], height: 1.5),
+                   ),
+                   const SizedBox(height: 12),
+                   // Contributing factors
+                   if (features != null) _buildContributingFactors(features, detected.isNotEmpty, isEducational: isEducational),
+                   // Show transcript summary if available
+                   if (transcript != null && transcript.isNotEmpty) ...[
+                     const SizedBox(height: 12),
+                     const Divider(),
+                     const SizedBox(height: 8),
+                     Text('📝 Analyzed Transcription:', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11, color: Colors.grey[700])),
+                     const SizedBox(height: 6),
+                     Container(
+                       padding: const EdgeInsets.all(10),
+                       decoration: BoxDecoration(
+                         color: Colors.grey[100],
+                         borderRadius: BorderRadius.circular(8),
+                       ),
+                       child: Text(
+                         transcript.length > 200 ? '${transcript.substring(0, 200)}...' : transcript,
+                         style: TextStyle(fontSize: 11, color: Colors.grey[600], fontStyle: FontStyle.italic, height: 1.4),
+                       ),
+                     ),
+                   ],
+                 ],
+               ),
+             ),
            ],
          ),
       );
   }
 
-  Widget _buildHighlightedTranscript(String text, Map<String, dynamic>? features) {
-    if (text == 'No transcription available.') return Text(text, style: const TextStyle(color: Colors.grey));
+  Widget _buildConfidenceGraph(List<dynamic> detected, bool isEducational) {
+     return Column(
+       children: [
+          const SizedBox(height: 20),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.grey[200]!),
+              boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 5)],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                 Row(
+                   children: [
+                     Icon(Icons.bar_chart, size: 18, color: isEducational ? Colors.teal : Colors.indigo),
+                     const SizedBox(width: 8),
+                     Text('Confidence Analysis', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.grey[800])),
+                   ],
+                 ),
+                 const SizedBox(height: 16),
+                 ...detected.take(5).map((item) {
+                    final double probability = (item['probability'] as num).toDouble();
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(item['name'], style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500)),
+                              Text('${probability.toInt()}%', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: probability > 70 ? Colors.red : (probability > 40 ? Colors.orange : Colors.green))),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(4),
+                            child: LinearProgressIndicator(
+                              value: probability / 100,
+                              backgroundColor: Colors.grey[100],
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                 probability > 70 ? Colors.red : (probability > 40 ? Colors.orange : Colors.green)
+                              ),
+                              minHeight: 8,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                 }).toList(),
+              ],
+            ),
+          ),
+       ],
+     );
+  }
+  
+  String _buildExplainableAI(Map<String, dynamic>? features, List<dynamic> detected, bool isEducational, String? transcript) {
+    if (features == null) {
+      return isEducational 
+        ? "Unable to analyze: No educational metrics available for this recording."
+        : "Unable to analyze: No anxiety biomarkers available for this recording.";
+    }
     
-    // Extract lists (safely handling dynamic types)
+    // Extract key features
+    final jitter = (features['jitter'] as num?)?.toDouble() ?? 0;
+    final shimmer = (features['shimmer'] as num?)?.toDouble() ?? 0;
+    final hnr = (features['hnr'] as num?)?.toDouble() ?? 0;
+    final negativeCount = (features['negative_count'] as num?)?.toInt() ?? 0;
+    final absolutistCount = (features['absolutist_count'] as num?)?.toInt() ?? 0;
+    final pitchMean = (features['pitch_mean'] as num?)?.toDouble() ?? 0;
+    final energyMean = (features['energy_mean'] as num?)?.toDouble() ?? 0;
+    final detectedEmotion = features['detected_emotion']?.toString() ?? 'Neutral';
+    final emotionConf = (features['emotion_confidence'] as num?)?.toDouble() ?? 0.5;
+    
+    // Get detected trigger words
+    List<String> negativeMatches = (features['negative_matches'] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [];
+    List<String> absolutistMatches = (features['absolutist_matches'] as List<dynamic>?)?.map((e) => e.toString()).toList() ?? [];
+    
+    StringBuffer explanation = StringBuffer();
+    
+    if (isEducational) {
+      // ===== EDUCATIONAL INSIGHTS - Focus on Learning & Cognitive Factors =====
+      // Educational trigger words (Taglish)
+      const educationalStressWords = [
+        'exam', 'test', 'quiz', 'assignment', 'project', 'deadline', 'submit', 'grade', 'fail', 'failed',
+        'pagod', 'antok', 'hirap', 'mahirap', 'stressed', 'pressure', 'aral', 'homework', 'thesis',
+        'late', 'absent', 'absent', 'bagsak', 'kulang'
+      ];
+      const positiveEducationalWords = [
+        'learn', 'learned', 'understand', 'gets', 'easy', 'madali', 'tapos', 'done', 'finish', 'passed',
+        'natutunan', 'nakuha', 'naintindihan', 'alam', 'ready', 'prepared'
+      ];
+      
+      List<String> foundStressWords = [];
+      List<String> foundPositiveWords = [];
+      
+      if (transcript != null && transcript.isNotEmpty) {
+        final words = transcript.toLowerCase().split(RegExp(r'[\s,\.!?]+'));
+        for (var word in words) {
+          final cleanWord = word.replaceAll(RegExp(r'[^\w]'), '');
+          if (educationalStressWords.contains(cleanWord) && !foundStressWords.contains(cleanWord)) {
+            foundStressWords.add(cleanWord);
+          }
+          if (positiveEducationalWords.contains(cleanWord) && !foundPositiveWords.contains(cleanWord)) {
+            foundPositiveWords.add(cleanWord);
+          }
+        }
+      }
+      
+      if (detected.isEmpty) {
+        explanation.writeln("📚 EDUCATIONAL ASSESSMENT: No cognitive stressors detected");
+        explanation.writeln("");
+        explanation.writeln("The student shows balanced academic indicators:");
+        explanation.writeln("");
+        
+        // Focus on cognitive clarity
+        if (hnr > 10) {
+          explanation.writeln("• Speech Clarity: Clear articulation (HNR: ${hnr.toStringAsFixed(1)}dB) indicates focused thinking.");
+        }
+        
+        // Energy levels for attention
+        if (energyMean > 0.3) {
+          explanation.writeln("• Attention Level: Voice energy suggests engaged and attentive state.");
+        } else {
+          explanation.writeln("• Calm Focus: Steady voice pattern indicates relaxed concentration.");
+        }
+        
+        // Absolutist thinking for cognitive flexibility
+        if (absolutistCount == 0) {
+          explanation.writeln("• Cognitive Flexibility: No rigid thinking patterns ('always'/'never') detected.");
+        }
+        
+        // Positive learning words
+        if (foundPositiveWords.isNotEmpty) {
+          explanation.writeln("• Positive Learning Indicators: Words like '${foundPositiveWords.take(3).join("', '")}' suggest academic confidence.");
+        }
+        
+        // No stress words
+        if (foundStressWords.isEmpty) {
+          explanation.writeln("• Academic Stress: No stress-related academic words detected in speech.");
+        }
+        
+      } else {
+        explanation.writeln("📚 EDUCATIONAL ASSESSMENT: Cognitive stressors identified");
+        explanation.writeln("");
+        
+        for (var indicator in detected.take(2)) {
+          explanation.writeln("⚠️ ${indicator['name']} (${indicator['probability']}% probability)");
+        }
+        explanation.writeln("");
+        
+        // Educational stress words
+        if (foundStressWords.isNotEmpty) {
+          explanation.writeln("• Academic Stress Words: '${foundStressWords.take(4).join("', '")}'");
+        }
+        
+        // Cognitive load indicators
+        if (jitter > 5) {
+          explanation.writeln("• Cognitive Load: Voice irregularity (${jitter.toStringAsFixed(2)}%) may indicate mental fatigue.");
+        }
+        
+        // Attention/focus issues
+        if (hnr < 10) {
+          explanation.writeln("• Attention Drift: Low speech clarity suggests possible attention difficulties.");
+        }
+        
+        // Rigid thinking
+        if (absolutistCount > 0) {
+          explanation.writeln("• Fixed Mindset: $absolutistCount absolute statements may indicate academic frustration.");
+        }
+      }
+      
+    } else {
+      // ===== ANXIETY CONDITIONS - Focus on Clinical Biomarkers =====
+      // Clinical anxiety words (Taglish)
+      const anxietyTriggerWords = [
+        'worried', 'scared', 'afraid', 'nervous', 'anxious', 'panic', 'fear', 'terrified',
+        'kinakabahan', 'kabado', 'natatakot', 'takot', 'nag-aalala', 'balisa', 'nerbiyoso',
+        'nanginginig', 'palpitate', 'hilo', 'nahihilo', 'breathless'
+      ];
+      const calmWords = [
+        'calm', 'relaxed', 'peaceful', 'okay', 'fine', 'safe',
+        'kalmado', 'relax', 'payapa', 'tahimik', 'okay', 'ayos'
+      ];
+      
+      List<String> foundAnxietyWords = [];
+      List<String> foundCalmWords = [];
+      
+      if (transcript != null && transcript.isNotEmpty) {
+        final words = transcript.toLowerCase().split(RegExp(r'[\s,\.!?]+'));
+        for (var word in words) {
+          final cleanWord = word.replaceAll(RegExp(r'[^\w]'), '');
+          if (anxietyTriggerWords.contains(cleanWord) && !foundAnxietyWords.contains(cleanWord)) {
+            foundAnxietyWords.add(cleanWord);
+          }
+          if (calmWords.contains(cleanWord) && !foundCalmWords.contains(cleanWord)) {
+            foundCalmWords.add(cleanWord);
+          }
+        }
+      }
+      
+      if (detected.isEmpty) {
+        explanation.writeln("🧠 CLINICAL ASSESSMENT: No anxiety biomarkers detected");
+        explanation.writeln("");
+        explanation.writeln("Voice analysis indicates balanced psychological state:");
+        explanation.writeln("");
+        
+        // Voice tremor analysis (clinical)
+        if (jitter < 5) {
+          explanation.writeln("• Voice Tremor: Jitter ${jitter.toStringAsFixed(2)}% within normal range - no tremor detected.");
+        }
+        
+        // Respiratory patterns
+        if (shimmer < 15) {
+          explanation.writeln("• Respiratory Pattern: Shimmer ${shimmer.toStringAsFixed(2)}% indicates steady breathing rhythm.");
+        }
+        
+        // Vocal cord tension
+        if (hnr > 10) {
+          explanation.writeln("• Vocal Cord Tension: HNR ${hnr.toStringAsFixed(1)}dB shows relaxed vocal production.");
+        }
+        
+        // Negative affect markers
+        if (negativeCount == 0) {
+          explanation.writeln("• Negative Affect: No distress language patterns detected.");
+        }
+        
+        // Calm words
+        if (foundCalmWords.isNotEmpty) {
+          explanation.writeln("• Positive Indicators: Calm words detected - '${foundCalmWords.take(3).join("', '")}'");
+        }
+        
+        // Emotion baseline
+        if (detectedEmotion == 'Neutral' || detectedEmotion == 'Happy' || detectedEmotion == 'Calm') {
+          explanation.writeln("• Baseline Emotion: '$detectedEmotion' (${(emotionConf * 100).toInt()}% confidence) - stable affect.");
+        }
+        
+      } else {
+        explanation.writeln("🧠 CLINICAL ASSESSMENT: Anxiety biomarkers identified");
+        explanation.writeln("");
+        
+        for (var indicator in detected.take(2)) {
+          explanation.writeln("⚠️ ${indicator['name']} (${indicator['probability']}% probability)");
+        }
+        explanation.writeln("");
+        
+        // Anxiety trigger words
+        if (foundAnxietyWords.isNotEmpty) {
+          explanation.writeln("• Anxiety Lexicon: '${foundAnxietyWords.take(4).join("', '")}'");
+        }
+        
+        // Voice tremor (clinical indicator)
+        if (jitter > 5) {
+          explanation.writeln("• Voice Tremor: Elevated jitter (${jitter.toStringAsFixed(2)}%) suggests vocal instability.");
+        }
+        
+        // Hyperventilation signs
+        if (shimmer > 15) {
+          explanation.writeln("• Respiratory Dysregulation: High shimmer indicates irregular breathing pattern.");
+        }
+        
+        // Muscle tension
+        if (hnr < 10) {
+          explanation.writeln("• Laryngeal Tension: Low HNR suggests tense vocal production.");
+        }
+        
+        // Negative affect
+        if (negativeMatches.isNotEmpty) {
+          explanation.writeln("• Distress Language: '${negativeMatches.take(3).join("', '")}'");
+        }
+        
+        // Anxious emotion
+        if (detectedEmotion == 'Sad' || detectedEmotion == 'Fear' || detectedEmotion == 'Angry') {
+          explanation.writeln("• Affect Dysregulation: '$detectedEmotion' emotion with ${(emotionConf * 100).toInt()}% confidence.");
+        }
+      }
+    }
+    
+    return explanation.toString().trim();
+  }
+  
+  Widget _buildContributingFactors(Map<String, dynamic> features, bool hasAnxiety, {bool isEducational = false}) {
+    final jitter = (features['jitter'] as num?)?.toDouble() ?? 0;
+    final shimmer = (features['shimmer'] as num?)?.toDouble() ?? 0;
+    final hnr = (features['hnr'] as num?)?.toDouble() ?? 0;
+    final negativeCount = (features['negative_count'] as num?)?.toInt() ?? 0;
+    final absolutistCount = (features['absolutist_count'] as num?)?.toInt() ?? 0;
+    final energyMean = (features['energy_mean'] as num?)?.toDouble() ?? 0.5;
+    
+    if (isEducational) {
+      // Educational-specific factors
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('📊 Learning Metrics:', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11, color: Colors.grey[700])),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              _buildFactorChip('Focus', hnr > 10 ? 'Clear' : 'Unclear', hnr > 10 ? Colors.green : Colors.orange),
+              _buildFactorChip('Energy', energyMean > 0.4 ? 'Active' : 'Low', energyMean > 0.4 ? Colors.green : Colors.orange),
+              _buildFactorChip('Flexibility', absolutistCount == 0 ? 'Good' : 'Rigid', absolutistCount == 0 ? Colors.green : Colors.red),
+              _buildFactorChip('Stress Words', negativeCount == 0 ? 'None' : '$negativeCount', negativeCount == 0 ? Colors.green : Colors.red),
+            ],
+          ),
+        ],
+      );
+    } else {
+      // Clinical anxiety factors
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('🏥 Clinical Biomarkers:', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11, color: Colors.grey[700])),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              _buildFactorChip('Tremor', jitter < 5 ? 'Normal' : 'Elevated', jitter < 5 ? Colors.green : Colors.orange),
+              _buildFactorChip('Breathing', shimmer < 15 ? 'Steady' : 'Irregular', shimmer < 15 ? Colors.green : Colors.orange),
+              _buildFactorChip('Tension', hnr > 10 ? 'Relaxed' : 'Tense', hnr > 10 ? Colors.green : Colors.orange),
+              _buildFactorChip('Distress', negativeCount == 0 ? 'None' : '$negativeCount', negativeCount == 0 ? Colors.green : Colors.red),
+            ],
+          ),
+        ],
+      );
+    }
+  }
+  
+  Widget _buildFactorChip(String label, String value, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.5)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('$label: ', style: TextStyle(fontSize: 10, color: Colors.grey[600])),
+          Text(value, style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: color)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHighlightedTranscript(String text, Map<String, dynamic>? features) {
+    if (text == 'No transcription available.') {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(text, style: const TextStyle(color: Colors.grey)),
+        ],
+      );
+    }
+    
+    // Color mapping per label - unique color for each anxiety/educational indicator
+    const Map<String, Color> labelColors = {
+      'Social_Anxiety': Color(0xFF9C27B0),     // Purple
+      'GAD': Color(0xFF3F51B5),                 // Indigo
+      'Panic_Disorder': Color(0xFFF44336),     // Red
+      'Test_Anxiety': Color(0xFF2196F3),       // Blue
+      'PTSD': Color(0xFF795548),               // Brown
+      'Agoraphobia': Color(0xFF009688),        // Teal
+      'Academic_Burnout': Color(0xFFFF5722),   // Deep Orange
+      'Perfectionism': Color(0xFF673AB7),      // Deep Purple
+      'Impostor_Syndrome': Color(0xFF607D8B),  // Blue Grey
+      'Low_Self_Esteem': Color(0xFFE91E63),    // Pink
+      'Fear_Of_Failure': Color(0xFFFF9800),    // Orange
+      'Poor_Time_Management': Color(0xFF00BCD4), // Cyan
+      'Lack_Of_Academic_Support': Color(0xFF8BC34A), // Light Green
+      'Pressure_Of_Surroundings': Color(0xFFCDDC39), // Lime
+    };
+    
+    // Extract trigger highlights from API response (per label)
+    Map<String, List<String>> triggerHighlights = {};
+    if (features?['trigger_highlights'] != null) {
+      final triggers = features!['trigger_highlights'] as Map<String, dynamic>;
+      triggers.forEach((label, keywords) {
+        if (keywords is List) {
+          triggerHighlights[label] = keywords.map((k) => k.toString().toLowerCase()).toList();
+        }
+      });
+    }
+    
+    // Extract basic word lists from features
     List<String> negatives = (features?['negative_matches'] as List<dynamic>?)?.map((e) => e.toString().toLowerCase()).toList() ?? [];
     List<String> absolutists = (features?['absolutist_matches'] as List<dynamic>?)?.map((e) => e.toString().toLowerCase()).toList() ?? [];
+    
+    // Track which labels have highlights for legend
+    Set<String> detectedLabels = {};
+    int triggerCount = 0;
     
     List<TextSpan> spans = [];
     final words = text.split(' ');
     
     for (String word in words) {
        String cleanWord = word.toLowerCase().replaceAll(RegExp(r'[^\w]'), '');
-       Color? color;
+       Color? bgColor;
+       Color textColor = Colors.black87;
        FontWeight? weight;
+       String? matchedLabel;
        
-       if (negatives.contains(cleanWord)) {
-          color = Colors.red;
-          weight = FontWeight.bold;
+       // Check each label's trigger keywords
+       for (var entry in triggerHighlights.entries) {
+         String label = entry.key;
+         List<String> keywords = entry.value;
+         
+         // Check if word matches any keyword (single word or part of phrase)
+         for (String kw in keywords) {
+           if (kw.split(' ').length == 1) {
+             // Single word keyword
+             if (cleanWord == kw) {
+               matchedLabel = label;
+               break;
+             }
+           } else {
+             // Multi-word phrase - check if word is part of phrase and phrase is in text
+             if (kw.contains(cleanWord) && text.toLowerCase().contains(kw)) {
+               matchedLabel = label;
+               break;
+             }
+           }
+         }
+         if (matchedLabel != null) break;
+       }
+       
+       // Apply color based on matched label
+       if (matchedLabel != null) {
+         Color labelColor = labelColors[matchedLabel] ?? Colors.purple;
+         bgColor = labelColor.withOpacity(0.2);
+         textColor = labelColor;
+         weight = FontWeight.bold;
+         detectedLabels.add(matchedLabel);
+         triggerCount++;
+       } else if (negatives.contains(cleanWord)) {
+         bgColor = Colors.red.withOpacity(0.2);
+         textColor = Colors.red[800]!;
+         weight = FontWeight.bold;
        } else if (absolutists.contains(cleanWord)) {
-          color = Colors.orange;
-          weight = FontWeight.bold;
+         bgColor = Colors.orange.withOpacity(0.2);
+         textColor = Colors.orange[800]!;
+         weight = FontWeight.bold;
        }
        
        spans.add(TextSpan(
           text: '$word ',
-          style: TextStyle(color: color ?? Colors.black87, fontWeight: weight ?? FontWeight.normal, fontSize: 13, height: 1.5)
+          style: TextStyle(
+            color: textColor, 
+            fontWeight: weight ?? FontWeight.normal, 
+            fontSize: 13, 
+            height: 1.5,
+            backgroundColor: bgColor,
+          )
        ));
     }
     
-    return RichText(text: TextSpan(children: spans));
+    // Determine summary message
+    String summaryText;
+    Color summaryColor;
+    IconData summaryIcon;
+    
+    int negativeCount = negatives.length;
+    int absolutistCount = absolutists.length;
+    
+    if (triggerCount > 0 || negativeCount > 0) {
+      summaryText = 'Indicators detected: $negativeCount negative, $absolutistCount absolutist, $triggerCount trigger words';
+      summaryColor = Colors.red;
+      summaryIcon = Icons.warning_amber_rounded;
+    } else {
+      summaryText = 'Neutral language - no strong indicators detected';
+      summaryColor = Colors.green;
+      summaryIcon = Icons.check_circle_outline;
+    }
+    
+    // Build dynamic legend for detected labels
+    List<Widget> legendItems = [
+      _buildLegendDot('Negative', Colors.red),
+      _buildLegendDot('Absolutist', Colors.orange),
+    ];
+    
+    // Add legend items for each detected label
+    for (String label in detectedLabels) {
+      String displayName = label.replaceAll('_', ' ');
+      Color labelColor = labelColors[label] ?? Colors.purple;
+      legendItems.add(_buildLegendDot(displayName, labelColor));
+    }
+    
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        RichText(text: TextSpan(children: spans)),
+        const SizedBox(height: 12),
+        const Divider(),
+        const SizedBox(height: 8),
+        // Summary message
+        Row(
+          children: [
+            Icon(summaryIcon, size: 16, color: summaryColor),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(summaryText, style: TextStyle(fontSize: 11, color: summaryColor, fontWeight: FontWeight.w500)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        // Dynamic Legend
+        Wrap(
+          spacing: 12,
+          runSpacing: 6,
+          children: legendItems,
+        ),
+      ],
+    );
+  }
+  
+  Widget _buildLegendDot(String label, Color color) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.3),
+            borderRadius: BorderRadius.circular(2),
+            border: Border.all(color: color, width: 1),
+          ),
+        ),
+        const SizedBox(width: 4),
+        Text(label, style: TextStyle(fontSize: 10, color: Colors.grey[600])),
+      ],
+    );
   }
 
   Widget _buildIndicatorCard(Map<String, dynamic> indicator, Map<String, dynamic>? features) {
@@ -5522,50 +7046,105 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       // Determine contributors based on Rules (Mirroring Python logic)
       List<Widget> contributors = [];
       
-      // Rule 1: Emotion
-      bool emotionMatch = false;
-      if (['Social Anxiety', 'GAD', 'Agoraphobia', 'Panic Disorder'].contains(name) && ['Fear', 'Angry'].contains(emotion)) emotionMatch = true;
-      if (name == 'PTSD' && emotion == 'Fear') emotionMatch = true;
+      // NEW: Use Backend Evidence if available (Prioritize specific reasons)
+      final List<dynamic>? evidence = indicator['supporting_evidence'];
       
-      if (emotionMatch) {
-         contributors.add(_buildContributorRow(Icons.mood_bad, "Emotion Match", "Detected '$emotion' aligns with $name profile.", Colors.purple));
-      }
-      
-      // Rule 2: Voice
-      bool voiceMatch = false;
-      if (['Social Anxiety', 'Panic Disorder', 'GAD'].contains(name) && (jitter + shimmer) > 0.02) voiceMatch = true;
-      
-      if (voiceMatch) {
-         contributors.add(_buildContributorRow(Icons.graphic_eq, "Acoustic Stress", "High vocal instability (fluctuation in pitch/volume).", Colors.blue));
-      }
-      
-      // Rule 3: Text (Negative)
-      if (['Fear Of Failure', 'Low Self Esteem', 'Test Anxiety'].contains(name) && negVal > 0) {
-         String reason = "Used negative language";
-         if (hasNegRaw) {
-             String list = negWords.isNotEmpty ? ": [${negWords.take(4).join(', ')}${negWords.length > 4 ? ', ...' : ''}]" : "";
-             reason = "Used $negVal negative keywords$list";
-         } else {
-             reason = "High negative sentiment detected in text.";
-         }
-         contributors.add(_buildContributorRow(Icons.text_fields, "Negative Sentiment", reason, Colors.red));
-      }
-      
-      // Rule 4: Text (Absolutist)
-      if (['Perfectionism', 'Impostor Syndrome'].contains(name) && absVal > 0) {
-          String reason = "Used absolutist language";
-          if (hasAbsRaw) {
-             String list = absWords.isNotEmpty ? ": [${absWords.take(4).join(', ')}${absWords.length > 4 ? ', ...' : ''}]" : "";
-             reason = "Used $absVal absolutist terms$list";
-          } else {
-             reason = "Absolutist language patterns detected.";
+      if (evidence != null && evidence.isNotEmpty) {
+        for (var item in evidence) {
+           IconData iconData = Icons.info_outline;
+           Color iconColor = Colors.blue;
+           
+           // Map string icons to IconData
+           switch (item['icon']) {
+             case 'text_fields': iconData = Icons.text_fields; iconColor = Colors.orange; break;
+             case 'graphic_eq': iconData = Icons.graphic_eq; iconColor = Colors.red; break;
+             case 'air': iconData = Icons.air; iconColor = Colors.purple; break;
+             case 'sentiment_dissatisfied': iconData = Icons.sentiment_dissatisfied; iconColor = Colors.redAccent; break;
+             case 'psychology': iconData = Icons.psychology; iconColor = Colors.indigo; break;
+           }
+           
+           contributors.add(_buildContributorRow(
+             iconData, 
+             item['title'] ?? 'Factor', 
+             item['text'] ?? 'Contributing factor detected', 
+             iconColor
+           ));
+        }
+      } else {
+          // Fallback to LEGACY Hardcoded Rules if API didn't provide specific evidence
+          // Rule 1: Emotion
+          bool emotionMatch = false;
+          if (['Social Anxiety', 'GAD', 'Agoraphobia', 'Panic Disorder'].contains(name) && ['Fear', 'Angry'].contains(emotion)) emotionMatch = true;
+          if (name == 'PTSD' && emotion == 'Fear') emotionMatch = true;
+          
+          if (emotionMatch) {
+             contributors.add(_buildContributorRow(Icons.mood_bad, "Emotion Match", "Detected '$emotion' aligns with $name profile.", Colors.purple));
           }
-          contributors.add(_buildContributorRow(Icons.rule, "Absolutist Language", reason, Colors.orange));
+          
+          // Rule 2: Voice
+          bool voiceMatch = false;
+          if (['Social Anxiety', 'Panic Disorder', 'GAD'].contains(name) && (jitter + shimmer) > 0.02) voiceMatch = true;
+          
+          if (voiceMatch) {
+             contributors.add(_buildContributorRow(Icons.graphic_eq, "Acoustic Stress", "High vocal instability (fluctuation in pitch/volume).", Colors.blue));
+          }
+          
+          // Rule 3: Text (Negative)
+          if (['Fear Of Failure', 'Low Self Esteem', 'Test Anxiety'].contains(name) && negVal > 0) {
+             String reason = "Used negative language";
+             if (hasNegRaw) {
+                 String list = negWords.isNotEmpty ? ": [${negWords.take(4).join(', ')}${negWords.length > 4 ? ', ...' : ''}]" : "";
+                 reason = "Used $negVal negative keywords$list";
+             } else {
+                 reason = "High negative sentiment detected in text.";
+             }
+             contributors.add(_buildContributorRow(Icons.text_fields, "Negative Sentiment", reason, Colors.red));
+          }
+          
+          // Rule 4: Text (Absolutist)
+          if (['Perfectionism', 'Impostor Syndrome'].contains(name) && absVal > 0) {
+              String reason = "Used absolutist language";
+              if (hasAbsRaw) {
+                 String list = absWords.isNotEmpty ? ": [${absWords.take(4).join(', ')}${absWords.length > 4 ? ', ...' : ''}]" : "";
+                 reason = "Used $absVal absolutist terms$list";
+              } else {
+                 reason = "Absolutist language patterns detected.";
+              }
+              contributors.add(_buildContributorRow(Icons.rule, "Absolutist Language", reason, Colors.orange));
+          }
+          
+          // Rule 5: TRIGGER KEYWORDS for ALL labels - show which keywords triggered this prediction
+          String labelKey = name.replaceAll(' ', '_');
+          if (features?['trigger_highlights'] != null) {
+            final triggers = features!['trigger_highlights'] as Map<String, dynamic>?;
+            if (triggers != null && triggers.containsKey(labelKey)) {
+              List<String> keywords = (triggers[labelKey] as List<dynamic>).map((k) => k.toString()).toList();
+              if (keywords.isNotEmpty) {
+                String kwList = keywords.take(5).join(', ');
+                contributors.add(_buildContributorRow(
+                  Icons.key, 
+                  "Trigger Keywords", 
+                  "Found: [$kwList]", 
+                  Colors.green
+                ));
+              }
+            }
+          }
+          
+          // Fallback
+          if (contributors.isEmpty) {
+              contributors.add(_buildContributorRow(Icons.category, "Biomarker Match", "AI detected patterns consistent with $name.", Colors.grey));
+          }
       }
       
-      // Fallback
-      if (contributors.isEmpty) {
-          contributors.add(_buildContributorRow(Icons.category, "General Stress", "Elevated overall stress score.", Colors.grey));
+      // Extract trigger keywords for THIS specific indicator
+      String labelKey = name.replaceAll(' ', '_'); // Convert "Social Anxiety" to "Social_Anxiety"
+      List<String> triggerKeywords = [];
+      if (features?['trigger_highlights'] != null) {
+        final triggers = features!['trigger_highlights'] as Map<String, dynamic>;
+        if (triggers.containsKey(labelKey)) {
+          triggerKeywords = (triggers[labelKey] as List<dynamic>).map((k) => k.toString()).toList();
+        }
       }
   
       return Container(
@@ -5589,6 +7168,37 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                  )
                ],
              ),
+             
+             // Show trigger keywords if any
+             if (triggerKeywords.isNotEmpty) ...[
+               const SizedBox(height: 12),
+               Row(
+                 crossAxisAlignment: CrossAxisAlignment.start,
+                 children: [
+                   Icon(Icons.key, size: 14, color: Colors.green[700]),
+                   const SizedBox(width: 6),
+                   Text("Trigger Keywords: ", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.green[700])),
+                 ],
+               ),
+               const SizedBox(height: 6),
+               Wrap(
+                 spacing: 6,
+                 runSpacing: 4,
+                 children: triggerKeywords.take(5).map((kw) => Container(
+                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                   decoration: BoxDecoration(
+                     color: Colors.green.withOpacity(0.15),
+                     borderRadius: BorderRadius.circular(12),
+                     border: Border.all(color: Colors.green.withOpacity(0.5)),
+                   ),
+                   child: Text(
+                     kw,
+                     style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.green[800]),
+                   ),
+                 )).toList(),
+               ),
+             ],
+             
              const SizedBox(height: 12),
              const Text("Primary Contributing Factors:", style: TextStyle(fontSize: 12, color: Colors.grey)),
              const SizedBox(height: 8),
@@ -5665,12 +7275,10 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                 ),
                 const SizedBox(height: 60),
                 
-                // Nav Items
-                _buildNavItem(0, 'Overview', Icons.dashboard_outlined),
-                _buildNavItem(1, 'Analytics', Icons.bar_chart_outlined),
-                _buildNavItem(2, 'Record', Icons.fiber_manual_record),
-                _buildNavItem(3, 'Recordings', Icons.folder_open_outlined),
-                _buildNavItem(4, 'Settings', Icons.settings_outlined),
+                // Nav Items (Record and Settings removed)
+              _buildNavItem(0, 'Overview', Icons.dashboard_outlined),
+              _buildNavItem(1, 'Analytics', Icons.bar_chart_outlined),
+              _buildNavItem(2, 'Recordings', Icons.folder_open_outlined),
                 
                 const Spacer(),
                 
@@ -5684,19 +7292,22 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
                         child: Icon(Icons.person, color: Color(0xFF2E7D32)),
                       ),
                       const SizedBox(width: 12),
-                      Column(
+                      Expanded(
+                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text(
-                            'Admin User',
-                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                          Text(
+                            _adminFullName,
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                            overflow: TextOverflow.ellipsis,
                           ),
                           Text(
-                            'Pro Plan',
-                            style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            'ID: $_currentAdminId',
+                            style: TextStyle(fontSize: 11, color: Colors.grey[600]),
                           ),
                         ],
                       ),
+                    ),  
                     ],
                   ),
                 ),
@@ -5801,6 +7412,16 @@ class _WebDashboardScreenState extends State<WebDashboardScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Title above icon
+          Text(
+            title,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey[600],
+            ),
+          ),
+          const SizedBox(height: 10),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
